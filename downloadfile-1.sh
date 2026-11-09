@@ -17,8 +17,8 @@ android {
         applicationId = "com.bahith.pdf"
         minSdk = 26
         targetSdk = 34
-        versionCode = 5
-        versionName = "1.4"
+        versionCode = 6
+        versionName = "1.5"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
 
@@ -226,16 +226,19 @@ object Arabic {
         val words = s.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
         val arabicWords = words.count { w -> arabicLetterCount(w) >= 2 }
         val oneLetterWords = words.count { w -> w.length == 1 && arabicLetterCount(w) == 1 }
+        val latinInArabicText = s.count { it in 'A'..'Z' || it in 'a'..'z' }
         val replacements = s.count { it == '\uFFFD' || it == '\u0000' }
-        val odd = s.count { !(it.isLetterOrDigit() || it.isWhitespace() || it in "،؛؟.!():-ـ\u064B-\u065F") }
+        val privateUse = s.count { Character.getType(it) == Character.PRIVATE_USE.toInt() }
         val arabicRatio = arabic.toDouble() / letters
         val wordRatio = if (words.isEmpty()) 0.0 else arabicWords.toDouble() / words.size
         val oneLetterPenalty = if (words.isEmpty()) 0.0 else oneLetterWords.toDouble() / words.size
-        val replacementPenalty = replacements.toDouble() / s.length.coerceAtLeast(1)
-        val oddPenalty = odd.toDouble() / s.length.coerceAtLeast(1)
-        return (arabicRatio * 35.0 + wordRatio * 45.0 + (1.0 - oneLetterPenalty) * 10.0 +
-            (1.0 - replacementPenalty.coerceAtMost(1.0)) * 7.0 +
-            (1.0 - oddPenalty.coerceAtMost(1.0)) * 3.0).coerceIn(0.0, 100.0)
+        val replacementPenalty = (replacements + privateUse).toDouble() / s.length.coerceAtLeast(1)
+        val latinPenalty = if (arabic < 12) 0.0 else latinInArabicText.toDouble() / letters
+        // مؤشر فرز تقريبي لاختبار سلامة النص، وليس حكماً لغوياً على صحته.
+        return (arabicRatio * 30.0 + wordRatio * 42.0 +
+            (1.0 - oneLetterPenalty) * 10.0 +
+            (1.0 - replacementPenalty.coerceAtMost(1.0)) * 8.0 +
+            (1.0 - latinPenalty.coerceAtMost(1.0)) * 10.0).coerceIn(0.0, 100.0)
     }
 
     fun arabicLetterCount(s: String): Int = s.count {
@@ -586,7 +589,7 @@ class Indexer(private val ctx: Context, private val dao: BookDao) {
 
     private suspend fun ocr(src: PdfSource, index: Int): String {
         val api = tessApi() ?: return ""
-        val bmp = src.render(index, 2000) ?: return ""
+        val bmp = src.render(index, 2600) ?: return ""
         return try {
             api.setImage(bmp)
             api.getUTF8Text() ?: ""
@@ -634,10 +637,18 @@ class Indexer(private val ctx: Context, private val dao: BookDao) {
                     text = try {
                         stripper.setStartPage(p)
                         stripper.setEndPage(p)
-                        // احفظ النص المستخرج كما هو قدر الإمكان؛ التطبيع يقتصر على عمود البحث norm.
-                        stripper.getText(doc).replace("\u0000", "")
+                        // نجرب ترتيب PDFBox المكاني ثم ترتيب تدفق المحتوى؛ بعض ملفات العربية
+                        // تحفظ المحارف بترتيب داخلي يختلف عن ترتيب مواقعها على الصفحة.
+                        stripper.setSortByPosition(true)
+                        val positioned = stripper.getText(doc).replace("\u0000", "")
+                        stripper.setSortByPosition(false)
+                        val contentOrder = stripper.getText(doc).replace("\u0000", "")
+                        if (Arabic.textQuality(contentOrder) > Arabic.textQuality(positioned) + 1.0)
+                            contentOrder else positioned
                     } catch (e: Exception) {
                         ""
+                    } finally {
+                        stripper.setSortByPosition(true)
                     }
                 }
                 val nativeLetters = Arabic.letterCount(text)
@@ -1389,6 +1400,7 @@ fun SettingsScreen(vm: AppViewModel) {
                 Text("• متابعة القراءة من آخر صفحة")
                 Text("• نسخ نص الصفحة من القارئ")
                 Text("• إبقاء الشاشة مفعّلة أثناء الفهرسة")
+                Text("• فحص بديل لترتيب استخراج PDF واكتشاف تلف الترميز قبل اللجوء إلى OCR")
                 Text("• مكتبة عامة للبحث عن الكتب المفتوحة وتنزيل ملفات PDF وإضافتها للمكتبة المحلية")
                 Text("• استيراد PDF وTXT وEPUB، وحفظ النسخة داخل التطبيق")
                 Text("• تنزيل الكتاب ثم فهرسته للبحث المحلي دون إنترنت")
@@ -1735,7 +1747,7 @@ data class Hit(
 
 data class ReaderTarget(val bookId: Long, val page: Int, val terms: List<String>)
 
-const val APP_VERSION = "1.4"
+const val APP_VERSION = "1.5"
 
 fun arrangeBooks(list: List<BookEntity>, filter: String, sort: Int): List<BookEntity> {
     val f = Arabic.normalize(filter)
