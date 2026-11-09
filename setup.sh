@@ -17,8 +17,8 @@ android {
         applicationId = "com.bahith.pdf"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "1.2"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
 
@@ -118,6 +118,10 @@ mkdir -p "$(dirname "app/src/main/AndroidManifest.xml")"
 cat > "app/src/main/AndroidManifest.xml" <<'__EOF__'
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:allowBackup="true"
         android:label="باحث PDF"
@@ -126,6 +130,10 @@ cat > "app/src/main/AndroidManifest.xml" <<'__EOF__'
         android:supportsRtl="true"
         android:largeHeap="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <service
+            android:name=".IndexService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -160,7 +168,9 @@ object Arabic {
         'أ', 'إ', 'آ', 'ٱ' -> 'ا'
         'ى', 'ئ' -> 'ي'
         'ؤ' -> 'و'
-        'ة' -> 'ه'
+        'ة', 'ۃ', 'ۀ', 'ھ' -> 'ه'
+        'ی' -> 'ي'
+        'ک' -> 'ك'
         else -> c
     }
 
@@ -199,6 +209,23 @@ object Arabic {
         normalize(q).split(' ').filter { it.isNotEmpty() }
 
     fun letterCount(s: String): Int = s.count { it.isLetter() }
+
+    private val COMMON = setOf(
+        "في", "من", "علي", "عن", "الي", "الله", "قال", "ان", "ما", "لا", "هذا", "التي", "الذي",
+        "بن", "ابي", "النبي", "رسول", "كان", "ثم", "او", "قد", "كل", "اذا", "لم", "انه", "عليه",
+        "وسلم", "حدثنا", "هو", "به", "ذلك", "فقال", "وقال", "ابن", "اللهم", "هي", "وهو", "مع"
+    )
+
+    /** يكتشف النص التالف المستخرج من ملف PDF (حروف ناقصة أو كلمات معكوسة). */
+    fun looksCorrupted(raw: String): Boolean {
+        val norm = normalize(raw)
+        if (norm.contains("ملسو هيلع")) return true
+        val toks = norm.split(' ').filter { t -> t.any { it in '\u0621'..'\u064A' } }
+        if (toks.size < 25) return false
+        val singles = toks.count { it.length == 1 }.toDouble() / toks.size
+        val common = toks.count { it in COMMON }.toDouble() / toks.size
+        return singles > 0.12 || common < 0.025
+    }
 
     fun ftsQuery(terms: List<String>, mode: SearchMode): String = when (mode) {
         SearchMode.ALL -> terms.joinToString(" ")
@@ -427,10 +454,16 @@ import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.text.PDFTextStripper
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.Closeable
 import java.io.File
@@ -475,17 +508,21 @@ class PdfSource(file: File) : Closeable {
     }
 }
 
-class Indexer(private val ctx: Context, private val dao: BookDao) {
+/**
+ * extractMode: 0 = تلقائي (يكتشف النص التالف ويستخدم OCR)، 1 = OCR لكل الصفحات، 2 = نص PDF فقط.
+ * workers: عدد معالجات OCR المتوازية. ocrWidth: عرض الصورة بالبكسل للـ OCR.
+ */
+data class IndexOptions(val extractMode: Int, val workers: Int, val ocrWidth: Int)
 
-    private var tess: TessBaseAPI? = null
+/** مجموعة محركات Tesseract للعمل المتوازي. */
+class OcrPool(ctx: Context, size: Int) {
+    private val channel = Channel<TessBaseAPI>(Channel.UNLIMITED)
+    private val all = ArrayList<TessBaseAPI>()
+    val available: Boolean
 
     init {
-        PDFBoxResourceLoader.init(ctx.applicationContext)
-    }
-
-    private fun tessApi(): TessBaseAPI? {
-        tess?.let { return it }
-        return try {
+        var ok = false
+        try {
             val root = File(ctx.filesDir, "tess")
             val td = File(root, "tessdata")
             td.mkdirs()
@@ -495,34 +532,59 @@ class Indexer(private val ctx: Context, private val dao: BookDao) {
                     f.outputStream().use { o -> i.copyTo(o) }
                 }
             }
-            val api = TessBaseAPI()
-            if (!api.init(root.absolutePath, "ara")) {
-                api.recycle()
-                null
-            } else {
-                tess = api
-                api
+            repeat(size) {
+                val api = TessBaseAPI()
+                if (api.init(root.absolutePath, "ara")) {
+                    all.add(api)
+                    channel.trySend(api)
+                } else {
+                    api.recycle()
+                }
             }
+            ok = all.isNotEmpty()
         } catch (e: Exception) {
-            null
+            ok = all.isNotEmpty()
         }
+        available = ok
     }
 
-    private suspend fun ocr(src: PdfSource, index: Int): String {
-        val api = tessApi() ?: return ""
-        val bmp = src.render(index, 2000) ?: return ""
+    suspend fun recognize(bmp: Bitmap): String {
+        val api = channel.receive()
         return try {
             api.setImage(bmp)
             api.getUTF8Text() ?: ""
         } catch (e: Exception) {
             ""
         } finally {
+            channel.trySend(api)
+        }
+    }
+
+    fun close() {
+        for (a in all) {
+            try { a.recycle() } catch (_: Exception) {}
+        }
+        all.clear()
+    }
+}
+
+class Indexer(private val ctx: Context, private val dao: BookDao) {
+
+    init {
+        PDFBoxResourceLoader.init(ctx.applicationContext)
+    }
+
+    private suspend fun ocrPage(s: PdfSource, index: Int, width: Int, pool: OcrPool): String {
+        val bmp = s.render(index, width) ?: return ""
+        return try {
+            pool.recognize(bmp)
+        } finally {
             bmp.recycle()
         }
     }
 
     /** يفهرس الكتاب مرة واحدة. يمكن استئنافه من آخر صفحة. */
-    suspend fun index(bookId: Long, forceOcr: Boolean, restart: Boolean, autoOcr: Boolean) {
+    suspend fun index(bookId: Long, forceOcr: Boolean, restart: Boolean, opts: IndexOptions) {
         val book = dao.getBook(bookId) ?: return
         if (book.status == ST_DONE && !forceOcr && !restart) return
         val file = File(ctx.filesDir, "books/$bookId.pdf")
@@ -535,12 +597,29 @@ class Indexer(private val ctx: Context, private val dao: BookDao) {
         if (reset) dao.deletePages(bookId)
         dao.setProgress(bookId, done, ST_INDEXING)
 
+        val allOcr = forceOcr || opts.extractMode == 1
+        val textOnly = !allOcr && opts.extractMode == 2
+        val workers = opts.workers.coerceIn(1, 4)
+
         var src: PdfSource? = null
         var doc: PDDocument? = null
+        var pool: OcrPool? = null
+        var poolTried = false
+
+        fun ensurePool(): OcrPool? {
+            if (!poolTried) {
+                poolTried = true
+                val p = OcrPool(ctx, workers)
+                if (p.available) pool = p else p.close()
+            }
+            return pool
+        }
+
         try {
-            src = PdfSource(file)
-            val total = src.pageCount
-            if (!forceOcr) {
+            val s = PdfSource(file)
+            src = s
+            val total = s.pageCount
+            if (!allOcr) {
                 doc = try {
                     PDDocument.load(file, MemoryUsageSetting.setupMixed(64L * 1024 * 1024))
                 } catch (e: Exception) {
@@ -549,36 +628,61 @@ class Indexer(private val ctx: Context, private val dao: BookDao) {
             }
             val stripper = PDFTextStripper()
             stripper.setSortByPosition(true)
-            val buf = ArrayList<PageEntity>()
-            for (p in (done + 1)..total) {
+            val sem = Semaphore(workers)
+            val chunk = 8
+
+            var p = done + 1
+            while (p <= total) {
                 currentCoroutineContext().ensureActive()
-                var text = ""
-                if (doc != null) {
-                    text = try {
-                        stripper.setStartPage(p)
-                        stripper.setEndPage(p)
-                        Normalizer.normalize(stripper.getText(doc), Normalizer.Form.NFKC)
-                    } catch (e: Exception) {
-                        ""
+                val end = minOf(total, p + chunk - 1)
+                val n = end - p + 1
+                val texts = Array(n) { "" }
+                val needOcr = BooleanArray(n)
+
+                for (i in p..end) {
+                    var t = ""
+                    val d = doc
+                    if (!allOcr && d != null) {
+                        t = try {
+                            stripper.setStartPage(i)
+                            stripper.setEndPage(i)
+                            Normalizer.normalize(stripper.getText(d), Normalizer.Form.NFKC)
+                        } catch (e: Exception) {
+                            ""
+                        }
+                    }
+                    texts[i - p] = t
+                    needOcr[i - p] = allOcr ||
+                        (!textOnly && (Arabic.letterCount(t) < 15 || Arabic.looksCorrupted(t)))
+                }
+
+                if (needOcr.any { it }) {
+                    val pl = ensurePool()
+                    if (pl != null) {
+                        coroutineScope {
+                            val jobs = (p..end).filter { needOcr[it - p] }.map { page ->
+                                async(Dispatchers.Default) {
+                                    val r = sem.withPermit {
+                                        ocrPage(s, page - 1, opts.ocrWidth, pl)
+                                    }
+                                    page to r
+                                }
+                            }
+                            for ((page, r) in jobs.awaitAll()) {
+                                if (r.isNotBlank()) texts[page - p] = r
+                            }
+                        }
                     }
                 }
-                if (Arabic.letterCount(text) < 15 && (autoOcr || forceOcr)) {
-                    val o = ocr(src, p - 1)
-                    if (o.isNotBlank()) text = o
+
+                val list = ArrayList<PageEntity>(n)
+                for (i in p..end) {
+                    val t = texts[i - p].trim()
+                    list.add(PageEntity(bookId = bookId, pageNo = i, text = t, norm = Arabic.normalize(t)))
                 }
-                buf.add(
-                    PageEntity(
-                        bookId = bookId,
-                        pageNo = p,
-                        text = text.trim(),
-                        norm = Arabic.normalize(text)
-                    )
-                )
-                if (buf.size >= 10 || p == total) {
-                    dao.insertPages(ArrayList(buf))
-                    buf.clear()
-                    dao.setProgress(bookId, p, if (p == total) ST_DONE else ST_INDEXING)
-                }
+                dao.insertPages(list)
+                dao.setProgress(bookId, end, if (end == total) ST_DONE else ST_INDEXING)
+                p = end + 1
             }
             if (done >= total) dao.setProgress(bookId, total, ST_DONE)
         } catch (e: CancellationException) {
@@ -588,8 +692,99 @@ class Indexer(private val ctx: Context, private val dao: BookDao) {
         } finally {
             try { doc?.close() } catch (_: Exception) {}
             src?.close()
-            try { tess?.recycle() } catch (_: Exception) {}
-            tess = null
+            pool?.close()
+        }
+    }
+}
+__EOF__
+mkdir -p "$(dirname "app/src/main/java/com/bahith/pdf/Service.kt")"
+cat > "app/src/main/java/com/bahith/pdf/Service.kt" <<'__EOF__'
+package com.bahith.pdf
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.Build
+import android.os.IBinder
+import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import java.util.concurrent.ConcurrentHashMap
+
+/** مكان واحد لأعمال الفهرسة، يبقى حياً حتى لو أُغلقت الشاشة. */
+object Work {
+    val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    val lock = Mutex()
+    val jobs = ConcurrentHashMap<Long, Job>()
+
+    @Volatile
+    private var idx: Indexer? = null
+
+    fun indexer(ctx: Context): Indexer = idx ?: synchronized(this) {
+        idx ?: Indexer(ctx.applicationContext, AppDb.get(ctx).dao()).also { idx = it }
+    }
+}
+
+/** خدمة أمامية تُبقي التطبيق يعمل أثناء الفهرسة، وتتوقف وحدها عند الانتهاء. */
+class IndexService : Service() {
+    private var watcher: Job? = null
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val mgr = getSystemService(NotificationManager::class.java)
+        mgr.createNotificationChannel(
+            NotificationChannel("index", "الفهرسة", NotificationManager.IMPORTANCE_LOW)
+        )
+        val n = Notification.Builder(this, "index")
+            .setContentTitle("باحث PDF")
+            .setContentText("جارٍ فهرسة الكتب…")
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setOngoing(true)
+            .build()
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            } else {
+                startForeground(1, n)
+            }
+        } catch (e: Exception) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        if (watcher == null) {
+            val dao = AppDb.get(this).dao()
+            watcher = Work.scope.launch {
+                dao.observeBooks().collect { list ->
+                    val busy = list.any { it.status == ST_QUEUED || it.status == ST_INDEXING }
+                    if (!busy) stopSelf()
+                }
+            }
+        }
+        return START_NOT_STICKY
+    }
+
+    override fun onDestroy() {
+        watcher?.cancel()
+        watcher = null
+        super.onDestroy()
+    }
+
+    companion object {
+        fun start(ctx: Context) {
+            try {
+                ContextCompat.startForegroundService(ctx, Intent(ctx, IndexService::class.java))
+            } catch (e: Exception) {
+                // إن منع النظام الخدمة نكمل الفهرسة داخل التطبيق فقط
+            }
         }
     }
 }
@@ -601,6 +796,7 @@ cat > "app/src/main/java/com/bahith/pdf/Ui.kt" <<'__EOF__'
 package com.bahith.pdf
 
 import android.graphics.Bitmap
+import android.os.Build
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -709,6 +905,15 @@ fun App(vm: AppViewModel = viewModel()) {
             val view = LocalView.current
             val busy = books.any { it.status == ST_QUEUED || it.status == ST_INDEXING }
             LaunchedEffect(busy, vm.keepAwake) { view.keepScreenOn = busy && vm.keepAwake }
+
+            val notifLauncher = rememberLauncherForActivityResult(
+                ActivityResultContracts.RequestPermission()
+            ) { }
+            LaunchedEffect(Unit) {
+                if (Build.VERSION.SDK_INT >= 33) {
+                    notifLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                }
+            }
 
             val picker = rememberLauncherForActivityResult(
                 ActivityResultContracts.OpenMultipleDocuments()
@@ -1251,11 +1456,30 @@ fun SettingsScreen(vm: AppViewModel) {
                     limits.map { "$it" },
                     limits.indexOf(vm.resultLimit).coerceAtLeast(0)
                 ) { vm.updateLimit(limits[it]) }
+                Text("عند فتح نتيجة بحث")
+                ChipRow(listOf("نص الصفحة", "صورة الصفحة"), vm.hitView) { vm.updateHitView(it) }
                 TextButton(onClick = { vm.clearHistory() }) { Text("مسح سجل البحث") }
             }
 
             SettingsCard("الفهرسة") {
-                SwitchRow("OCR تلقائي للصفحات التي بلا نص", vm.autoOcr) { vm.updateAutoOcr(it) }
+                Text("طريقة استخراج النص")
+                ChipRow(
+                    listOf("تلقائي (موصى به)", "OCR لكل الصفحات", "نص PDF فقط"),
+                    vm.extractMode
+                ) { vm.updateExtractMode(it) }
+                Text(
+                    "الوضع التلقائي يكتشف النص التالف داخل الملف ويقرأ تلك الصفحات بالـ OCR. " +
+                        "«OCR لكل الصفحات» أدق مع الكتب المشوّهة لكنه أبطأ.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Text("سرعة الفهرسة (عدد المعالجات)")
+                ChipRow(listOf("1", "2", "3", "4"), vm.workers - 1) { vm.updateWorkers(it + 1) }
+                Text("جودة الـ OCR")
+                ChipRow(listOf("سريعة", "متوازنة", "عالية"), vm.ocrQuality) { vm.updateOcrQuality(it) }
+                Text(
+                    "عدد أكبر وجودة أعلى يعنيان دقة وسرعة أكبر مقابل استهلاك أكثر للذاكرة والبطارية.",
+                    style = MaterialTheme.typography.bodySmall
+                )
                 SwitchRow("إبقاء الشاشة مفعّلة أثناء الفهرسة", vm.keepAwake) { vm.updateKeepAwake(it) }
                 TextButton(onClick = { confirmReindex = true }) { Text("إعادة فهرسة كل الكتب") }
             }
@@ -1273,6 +1497,13 @@ fun SettingsScreen(vm: AppViewModel) {
 
             SettingsCard("سجل التغييرات") {
                 Text("الإصدار $APP_VERSION", fontWeight = FontWeight.Bold)
+                Text("• اكتشاف النص التالف في ملفات PDF وقراءته بالـ OCR تلقائياً")
+                Text("• فهرسة أسرع: OCR متوازٍ مع اختيار السرعة والجودة")
+                Text("• الفهرسة تكمل في الخلفية وتظهر في الإشعارات")
+                Text("• توحيد أشكال الياء والكاف الفارسية في البحث")
+                Text("• خيار فتح نتائج البحث على صورة الصفحة الأصلية")
+                Spacer(Modifier.height(6.dp))
+                Text("الإصدار 1.1", fontWeight = FontWeight.Bold)
                 Text("• شاشة إعدادات: المظهر الداكن وحجم الخط ووضع البحث الافتراضي")
                 Text("• سجل بحث سابق للرجوع إليه بسرعة")
                 Text("• تعديل عنوان الكتاب والمؤلف")
@@ -1339,7 +1570,7 @@ fun ReaderScreen(vm: AppViewModel, target: ReaderTarget) {
         initialPage = (target.page - 1).coerceIn(0, total - 1)
     ) { total }
     val scope = rememberCoroutineScope()
-    var textMode by remember { mutableStateOf(target.terms.isNotEmpty()) }
+    var textMode by remember { mutableStateOf(target.terms.isNotEmpty() && vm.hitView == 0) }
     var zoomed by remember { mutableStateOf(false) }
     var showGo by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
@@ -1568,7 +1799,6 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -1583,7 +1813,7 @@ data class Hit(
 
 data class ReaderTarget(val bookId: Long, val page: Int, val terms: List<String>)
 
-const val APP_VERSION = "1.1"
+const val APP_VERSION = "1.2"
 
 fun arrangeBooks(list: List<BookEntity>, filter: String, sort: Int): List<BookEntity> {
     val f = Arabic.normalize(filter)
@@ -1607,9 +1837,6 @@ fun formatSize(bytes: Long): String {
 class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private val dao = AppDb.get(app).dao()
-    private val indexer = Indexer(app, dao)
-    private val indexLock = Mutex()
-    private val jobs = mutableMapOf<Long, Job>()
     private var searchJob: Job? = null
     private val prefs = app.getSharedPreferences("settings", Context.MODE_PRIVATE)
 
@@ -1623,7 +1850,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         SearchMode.values()[prefs.getInt("mode", 0).coerceIn(0, SearchMode.values().size - 1)]
     )
     var resultLimit by mutableIntStateOf(prefs.getInt("limit", 400))
-    var autoOcr by mutableStateOf(prefs.getBoolean("autoOcr", true))
+    var extractMode by mutableIntStateOf(prefs.getInt("extract", 0))
+    var workers by mutableIntStateOf(prefs.getInt("workers", 2))
+    var ocrQuality by mutableIntStateOf(prefs.getInt("ocrq", 1))
+    var hitView by mutableIntStateOf(prefs.getInt("hitview", 0))
     var keepAwake by mutableStateOf(prefs.getBoolean("keepAwake", true))
     var sortOrder by mutableIntStateOf(prefs.getInt("sort", 0))
     var history by mutableStateOf(
@@ -1638,7 +1868,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         prefs.edit().putInt("mode", m.ordinal).apply()
     }
     fun updateLimit(v: Int) { resultLimit = v; prefs.edit().putInt("limit", v).apply() }
-    fun updateAutoOcr(v: Boolean) { autoOcr = v; prefs.edit().putBoolean("autoOcr", v).apply() }
+    fun updateExtractMode(v: Int) { extractMode = v; prefs.edit().putInt("extract", v).apply() }
+    fun updateWorkers(v: Int) { workers = v; prefs.edit().putInt("workers", v).apply() }
+    fun updateOcrQuality(v: Int) { ocrQuality = v; prefs.edit().putInt("ocrq", v).apply() }
+    fun updateHitView(v: Int) { hitView = v; prefs.edit().putInt("hitview", v).apply() }
+
+    private fun options(): IndexOptions {
+        val width = when (ocrQuality) {
+            0 -> 1400
+            2 -> 2400
+            else -> 1800
+        }
+        return IndexOptions(extractMode, workers, width)
+    }
     fun updateKeepAwake(v: Boolean) { keepAwake = v; prefs.edit().putBoolean("keepAwake", v).apply() }
     fun updateSort(v: Int) { sortOrder = v; prefs.edit().putInt("sort", v).apply() }
 
@@ -1670,7 +1912,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         viewModelScope.launch {
-            dao.unfinished().forEach { startIndex(it.id) }
+            dao.unfinished().forEach {
+                if (Work.jobs[it.id]?.isActive != true) startIndex(it.id)
+            }
         }
     }
 
@@ -1715,10 +1959,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun startIndex(id: Long, forceOcr: Boolean = false, restart: Boolean = false) {
-        jobs[id]?.cancel()
-        val auto = autoOcr
-        jobs[id] = viewModelScope.launch(Dispatchers.Default) {
-            indexLock.withLock { indexer.index(id, forceOcr, restart, auto) }
+        Work.jobs[id]?.cancel()
+        val opts = options()
+        val app = getApplication<Application>()
+        Work.jobs[id] = Work.scope.launch {
+            if (restart || forceOcr) dao.setStatus(id, ST_QUEUED)
+            IndexService.start(app)
+            Work.lock.withLock { Work.indexer(app).index(id, forceOcr, restart, opts) }
         }
     }
 
@@ -1743,7 +1990,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun delete(id: Long) {
         viewModelScope.launch {
-            jobs.remove(id)?.cancelAndJoin()
+            Work.jobs.remove(id)?.cancelAndJoin()
             withContext(Dispatchers.IO) {
                 dao.deleteBookFully(id)
                 File(booksDir(), "$id.pdf").delete()
@@ -1754,8 +2001,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun deleteAll() {
         viewModelScope.launch {
-            jobs.values.toList().forEach { it.cancelAndJoin() }
-            jobs.clear()
+            Work.jobs.values.toList().forEach { it.cancelAndJoin() }
+            Work.jobs.clear()
             withContext(Dispatchers.IO) {
                 dao.deleteAllPages()
                 dao.deleteAllBooks()
