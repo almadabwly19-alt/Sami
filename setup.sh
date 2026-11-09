@@ -17,8 +17,8 @@ android {
         applicationId = "com.bahith.pdf"
         minSdk = 26
         targetSdk = 34
-        versionCode = 3
-        versionName = "1.2"
+        versionCode = 5
+        versionName = "1.4"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
 
@@ -56,6 +56,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
 
+    implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("androidx.room:room-runtime:2.6.1")
     implementation("androidx.room:room-ktx:2.6.1")
     ksp("androidx.room:room-compiler:2.6.1")
@@ -118,7 +119,10 @@ mkdir -p "$(dirname "app/src/main/AndroidManifest.xml")"
 cat > "app/src/main/AndroidManifest.xml" <<'__EOF__'
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:allowBackup="true"
         android:label="باحث PDF"
@@ -127,13 +131,34 @@ cat > "app/src/main/AndroidManifest.xml" <<'__EOF__'
         android:supportsRtl="true"
         android:largeHeap="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <service
+            android:name=".IndexService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTop"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:mimeType="application/pdf" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/pdf" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/pdf" />
             </intent-filter>
         </activity>
     </application>
@@ -153,20 +178,31 @@ enum class SearchMode(val label: String) {
     PHRASE("عبارة")
 }
 
+/** خيارات توحيد الحروف في البحث (تُغيَّر من الإعدادات). */
+object ArabicOpts {
+    @Volatile var taMarbuta = true
+    @Volatile var alefMaksura = true
+    @Volatile var hamza = true
+}
+
 object Arabic {
 
     class Norm(val text: String, val map: IntArray)
 
-    private fun fold(c: Char): Char = when (c) {
-        'أ', 'إ', 'آ', 'ٱ' -> 'ا'
-        'ى', 'ئ' -> 'ي'
-        'ؤ' -> 'و'
-        'ة' -> 'ه'
+    private fun fold(c: Char, d: Boolean): Char = when (c) {
+        'أ', 'إ', 'آ', 'ٱ' -> if (d || ArabicOpts.hamza) 'ا' else c
+        'ئ' -> if (d || ArabicOpts.hamza) 'ي' else c
+        'ؤ' -> if (d || ArabicOpts.hamza) 'و' else c
+        'ى' -> if (d || ArabicOpts.alefMaksura) 'ي' else c
+        'ة' -> if (d || ArabicOpts.taMarbuta) 'ه' else c
+        'ۃ', 'ۀ', 'ھ' -> 'ه'
+        'ی' -> 'ي'
+        'ک' -> 'ك'
         else -> c
     }
 
     /** يزيل التشكيل والتطويل، يوحّد الهمزات والألف المقصورة والتاء المربوطة، ويحوّل علامات الترقيم إلى مسافات. */
-    fun normalizeMapped(s: String): Norm {
+    fun normalizeMapped(s: String, defaults: Boolean = false): Norm {
         val sb = StringBuilder(s.length)
         val map = IntArray(s.length + 1)
         var lastSpace = true
@@ -177,7 +213,7 @@ object Arabic {
                 type == Character.FORMAT.toInt() ||
                 c == 'ـ'
             ) continue
-            c = fold(c)
+            c = fold(c, defaults)
             if (c in '٠'..'٩') c = '0' + (c - '٠')
             else if (c in '۰'..'۹') c = '0' + (c - '۰')
             if (Character.isLetterOrDigit(c)) {
@@ -199,7 +235,34 @@ object Arabic {
     fun terms(q: String): List<String> =
         normalize(q).split(' ').filter { it.isNotEmpty() }
 
+    /** يزيل التشكيل والتطويل فقط (للعرض). */
+    fun stripTashkeel(s: String): String {
+        val sb = StringBuilder(s.length)
+        for (c in s) {
+            if (Character.getType(c) == Character.NON_SPACING_MARK.toInt() || c == 'ـ') continue
+            sb.append(c)
+        }
+        return sb.toString()
+    }
+
     fun letterCount(s: String): Int = s.count { it.isLetter() }
+
+    private val COMMON = setOf(
+        "في", "من", "علي", "عن", "الي", "الله", "قال", "ان", "ما", "لا", "هذا", "التي", "الذي",
+        "بن", "ابي", "النبي", "رسول", "كان", "ثم", "او", "قد", "كل", "اذا", "لم", "انه", "عليه",
+        "وسلم", "حدثنا", "هو", "به", "ذلك", "فقال", "وقال", "ابن", "اللهم", "هي", "وهو", "مع"
+    )
+
+    /** يكتشف النص التالف المستخرج من ملف PDF (حروف ناقصة أو كلمات معكوسة). */
+    fun looksCorrupted(raw: String): Boolean {
+        val norm = normalizeMapped(raw, true).text
+        if (norm.contains("ملسو هيلع")) return true
+        val toks = norm.split(' ').filter { t -> t.any { it in '\u0621'..'\u064A' } }
+        if (toks.size < 25) return false
+        val singles = toks.count { it.length == 1 }.toDouble() / toks.size
+        val common = toks.count { it in COMMON }.toDouble() / toks.size
+        return singles > 0.12 || common < 0.025
+    }
 
     fun ftsQuery(terms: List<String>, mode: SearchMode): String = when (mode) {
         SearchMode.ALL -> terms.joinToString(" ")
@@ -271,6 +334,7 @@ const val ST_QUEUED = 0
 const val ST_INDEXING = 1
 const val ST_DONE = 2
 const val ST_ERROR = 3
+const val ST_REFINING = 4
 
 @Entity(tableName = "books")
 data class BookEntity(
@@ -285,7 +349,7 @@ data class BookEntity(
     val lastPage: Int = 1
 )
 
-@Entity(tableName = "pages", indices = [Index("bookId"), Index(value = ["bookId", "pageNo"], unique = true)])
+@Entity(tableName = "pages", indices = [Index("bookId")])
 data class PageEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val bookId: Long,
@@ -298,6 +362,8 @@ data class PageEntity(
 @Fts4(contentEntity = PageEntity::class)
 @Entity(tableName = "pages_fts")
 data class PageFts(val norm: String)
+
+data class IdText(val id: Long, val text: String)
 
 data class SearchRow(
     val bookId: Long,
@@ -314,7 +380,7 @@ abstract class BookDao {
     @Query("SELECT * FROM books WHERE id = :id")
     abstract suspend fun getBook(id: Long): BookEntity?
 
-    @Query("SELECT * FROM books WHERE status = 0 OR status = 1")
+    @Query("SELECT * FROM books WHERE status = 0 OR status = 1 OR status = 4")
     abstract suspend fun unfinished(): List<BookEntity>
 
     @Insert
@@ -359,6 +425,25 @@ abstract class BookDao {
     @Query("SELECT text FROM pages WHERE bookId = :bookId AND pageNo = :pageNo LIMIT 1")
     abstract suspend fun pageText(bookId: Long, pageNo: Int): String?
 
+    @Query("UPDATE pages SET text = :text, norm = :norm WHERE bookId = :bookId AND pageNo = :pageNo")
+    abstract suspend fun updatePage(bookId: Long, pageNo: Int, text: String, norm: String)
+
+    @Query("SELECT id, text FROM pages WHERE id > :after ORDER BY id LIMIT :n")
+    abstract suspend fun textBatch(after: Long, n: Int): List<IdText>
+
+    @Query("UPDATE pages SET norm = :norm WHERE id = :id")
+    abstract suspend fun setNorm(id: Long, norm: String)
+
+    @Transaction
+    open suspend fun updateMany(items: List<PageEntity>) {
+        for (e in items) updatePage(e.bookId, e.pageNo, e.text, e.norm)
+    }
+
+    @Transaction
+    open suspend fun renormBatch(items: List<IdText>) {
+        for (e in items) setNorm(e.id, Arabic.normalize(e.text))
+    }
+
     @Transaction
     open suspend fun deleteBookFully(id: Long) {
         deletePages(id)
@@ -377,15 +462,9 @@ val MIGRATION_1_2 = object : Migration(1, 2) {
     }
 }
 
-val MIGRATION_2_3 = object : Migration(2, 3) {
-    override fun migrate(db: SupportSQLiteDatabase) {
-        db.execSQL("CREATE INDEX IF NOT EXISTS index_pages_bookId_pageNo ON pages(bookId, pageNo)")
-    }
-}
-
 @Database(
     entities = [BookEntity::class, PageEntity::class, PageFts::class],
-    version = 3,
+    version = 2,
     exportSchema = false
 )
 abstract class AppDb : RoomDatabase() {
@@ -397,7 +476,7 @@ abstract class AppDb : RoomDatabase() {
 
         fun get(ctx: Context): AppDb = inst ?: synchronized(this) {
             inst ?: Room.databaseBuilder(ctx.applicationContext, AppDb::class.java, "bahith.db")
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+                .addMigrations(MIGRATION_1_2)
                 .build().also { inst = it }
         }
     }
@@ -407,14 +486,41 @@ mkdir -p "$(dirname "app/src/main/java/com/bahith/pdf/MainActivity.kt")"
 cat > "app/src/main/java/com/bahith/pdf/MainActivity.kt" <<'__EOF__'
 package com.bahith.pdf
 
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.viewModels
 
 class MainActivity : ComponentActivity() {
+    private val vm: AppViewModel by viewModels()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent { App() }
+        if (savedInstanceState == null) handleIntent(intent)
+        setContent { App(vm) }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleIntent(intent)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun handleIntent(i: Intent?) {
+        if (i == null) return
+        val uris = ArrayList<Uri>()
+        when (i.action) {
+            Intent.ACTION_VIEW -> i.data?.let { uris.add(it) }
+            Intent.ACTION_SEND -> i.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)?.let { uris.add(it) }
+            Intent.ACTION_SEND_MULTIPLE ->
+                i.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)?.let { uris.addAll(it) }
+        }
+        if (uris.isNotEmpty()) {
+            vm.tab = 0
+            vm.importUris(uris)
+        }
     }
 }
 __EOF__
@@ -434,13 +540,20 @@ import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.text.PDFTextStripper
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.Closeable
 import java.io.File
+import java.text.Normalizer
 
 /** عرض صفحات PDF كصور (يُستخدم في القارئ وفي الـ OCR). */
 class PdfSource(file: File) : Closeable {
@@ -481,54 +594,133 @@ class PdfSource(file: File) : Closeable {
     }
 }
 
-class Indexer(private val ctx: Context, private val dao: BookDao) {
+/**
+ * extractMode: 0 = تلقائي (يكتشف النص التالف ويستخدم OCR)، 1 = OCR لكل الصفحات، 2 = نص PDF فقط.
+ * workers: عدد معالجات OCR المتوازية. ocrWidth: عرض الصورة بالبكسل للـ OCR.
+ * bestModel: استعمال نموذج OCR الأدق (أبطأ). ignoreMarks: تجاهل التشكيل أثناء القراءة لدقة الحروف.
+ */
+data class IndexOptions(
+    val extractMode: Int,
+    val workers: Int,
+    val ocrWidth: Int,
+    val bestModel: Boolean,
+    val ignoreMarks: Boolean
+)
 
-    private var tess: TessBaseAPI? = null
+private const val MARKS = "\u064B\u064C\u064D\u064E\u064F\u0650\u0651\u0652\u0670"
+
+/** مجموعة محركات Tesseract للعمل المتوازي. */
+class OcrPool(ctx: Context, size: Int, best: Boolean, ignoreMarks: Boolean) {
+    private val channel = Channel<TessBaseAPI>(Channel.UNLIMITED)
+    private val all = ArrayList<TessBaseAPI>()
+    val available: Boolean
+
+    private fun hasAsset(ctx: Context, name: String): Boolean =
+        try {
+            ctx.assets.open(name).close()
+            true
+        } catch (e: Exception) {
+            false
+        }
 
     init {
-        PDFBoxResourceLoader.init(ctx.applicationContext)
-    }
-
-    private fun tessApi(): TessBaseAPI? {
-        tess?.let { return it }
-        return try {
-            val root = File(ctx.filesDir, "tess")
+        var ok = false
+        try {
+            val useBest = best && hasAsset(ctx, "tessdata/ara_best.traineddata")
+            val folder = if (useBest) "tess_best" else "tess"
+            val assetName = if (useBest) "tessdata/ara_best.traineddata" else "tessdata/ara.traineddata"
+            val root = File(ctx.filesDir, folder)
             val td = File(root, "tessdata")
             td.mkdirs()
             val f = File(td, "ara.traineddata")
             if (!f.exists() || f.length() == 0L) {
-                ctx.assets.open("tessdata/ara.traineddata").use { i ->
+                ctx.assets.open(assetName).use { i ->
                     f.outputStream().use { o -> i.copyTo(o) }
                 }
             }
-            val api = TessBaseAPI()
-            if (!api.init(root.absolutePath, "ara")) {
-                api.recycle()
-                null
-            } else {
-                tess = api
-                api
+            repeat(size) {
+                val api = TessBaseAPI()
+                if (api.init(root.absolutePath, "ara")) {
+                    if (ignoreMarks) api.setVariable("tessedit_char_blacklist", MARKS)
+                    all.add(api)
+                    channel.trySend(api)
+                } else {
+                    api.recycle()
+                }
             }
+            ok = all.isNotEmpty()
         } catch (e: Exception) {
-            null
+            ok = all.isNotEmpty()
         }
+        available = ok
     }
 
-    private suspend fun ocr(src: PdfSource, index: Int): String {
-        val api = tessApi() ?: return ""
-        val bmp = src.render(index, 2000) ?: return ""
+    suspend fun recognize(bmp: Bitmap): String {
+        val api = channel.receive()
         return try {
             api.setImage(bmp)
             api.getUTF8Text() ?: ""
         } catch (e: Exception) {
             ""
         } finally {
+            channel.trySend(api)
+        }
+    }
+
+    fun close() {
+        for (a in all) {
+            try { a.recycle() } catch (_: Exception) {}
+        }
+        all.clear()
+    }
+}
+
+class Indexer(private val ctx: Context, private val dao: BookDao) {
+
+    init {
+        PDFBoxResourceLoader.init(ctx.applicationContext)
+    }
+
+    private suspend fun ocrPage(s: PdfSource, index: Int, width: Int, pool: OcrPool): String {
+        val bmp = s.render(index, width) ?: return ""
+        return try {
+            pool.recognize(bmp)
+        } finally {
             bmp.recycle()
         }
     }
 
-    /** يفهرس الكتاب مرة واحدة. يمكن استئنافه من آخر صفحة. */
-    suspend fun index(bookId: Long, forceOcr: Boolean, restart: Boolean, autoOcr: Boolean) {
+    private fun readPending(f: File): MutableList<Int> =
+        try {
+            if (f.exists()) f.readText().split(",").mapNotNull { it.trim().toIntOrNull() }.toMutableList()
+            else mutableListOf()
+        } catch (e: Exception) {
+            mutableListOf()
+        }
+
+    private fun writePending(f: File, list: List<Int>) {
+        try { f.writeText(list.joinToString(",")) } catch (_: Exception) {}
+    }
+
+    /** قراءة صفحة واحدة بأدق إعدادات (للإصلاح اليدوي). */
+    suspend fun ocrOne(bookId: Long, pageNo: Int, ignoreMarks: Boolean): String {
+        val file = File(ctx.filesDir, "books/$bookId.pdf")
+        if (!file.exists()) return ""
+        val s = PdfSource(file)
+        val pool = OcrPool(ctx, 1, true, ignoreMarks)
+        return try {
+            if (!pool.available) "" else ocrPage(s, pageNo - 1, 2400, pool)
+        } finally {
+            pool.close()
+            s.close()
+        }
+    }
+
+    /**
+     * المرحلة 1: فهرسة سريعة من نص الملف (يصبح البحث متاحاً خلال دقائق).
+     * المرحلة 2: تحسين الصفحات التالفة بالـ OCR في الخلفية.
+     */
+    suspend fun index(bookId: Long, forceOcr: Boolean, restart: Boolean, opts: IndexOptions) {
         val book = dao.getBook(bookId) ?: return
         if (book.status == ST_DONE && !forceOcr && !restart) return
         val file = File(ctx.filesDir, "books/$bookId.pdf")
@@ -536,68 +728,224 @@ class Indexer(private val ctx: Context, private val dao: BookDao) {
             dao.setStatus(bookId, ST_ERROR)
             return
         }
+        val pendingFile = File(ctx.filesDir, "books/$bookId.pending")
         val reset = forceOcr || restart
-        val done = if (reset) 0 else book.indexedPages
-        if (reset) dao.deletePages(bookId)
-        dao.setProgress(bookId, done, ST_INDEXING)
+        val resumePhase2 = !reset && book.status == ST_REFINING
+        val workers = opts.workers.coerceIn(1, 6)
 
         var src: PdfSource? = null
         var doc: PDDocument? = null
+        var pool: OcrPool? = null
+        var poolTried = false
+
+        fun ensurePool(): OcrPool? {
+            if (!poolTried) {
+                poolTried = true
+                val p = OcrPool(ctx, workers, opts.bestModel, opts.ignoreMarks)
+                if (p.available) pool = p else p.close()
+            }
+            return pool
+        }
+
         try {
-            src = PdfSource(file)
-            val total = src.pageCount
-            if (!forceOcr) {
+            val s = PdfSource(file)
+            src = s
+            val total = s.pageCount
+            val textOnly = !forceOcr && opts.extractMode == 2
+            val allOcr = forceOcr || opts.extractMode == 1
+
+            if (!resumePhase2) {
+                if (reset) {
+                    dao.deletePages(bookId)
+                    pendingFile.delete()
+                }
+                val done = if (reset) 0 else book.indexedPages
+                dao.setProgress(bookId, done, ST_INDEXING)
                 doc = try {
                     PDDocument.load(file, MemoryUsageSetting.setupMixed(64L * 1024 * 1024))
                 } catch (e: Exception) {
                     null
                 }
+                val stripper = PDFTextStripper()
+                stripper.setSortByPosition(true)
+                val pending = readPending(pendingFile)
+                var p = done + 1
+                val chunk = 25
+                while (p <= total) {
+                    currentCoroutineContext().ensureActive()
+                    val end = minOf(total, p + chunk - 1)
+                    val list = ArrayList<PageEntity>(end - p + 1)
+                    for (i in p..end) {
+                        var t = ""
+                        val d = doc
+                        if (d != null) {
+                            t = try {
+                                stripper.setStartPage(i)
+                                stripper.setEndPage(i)
+                                Normalizer.normalize(stripper.getText(d), Normalizer.Form.NFKC)
+                            } catch (e: Exception) {
+                                ""
+                            }
+                        }
+                        val flagged = allOcr ||
+                            (!textOnly && (Arabic.letterCount(t) < 15 || Arabic.looksCorrupted(t)))
+                        if (flagged) pending.add(i)
+                        val tt = t.trim()
+                        list.add(PageEntity(bookId = bookId, pageNo = i, text = tt, norm = Arabic.normalize(tt)))
+                    }
+                    dao.insertPages(list)
+                    writePending(pendingFile, pending)
+                    dao.setProgress(bookId, end, ST_INDEXING)
+                    p = end + 1
+                }
+                try { doc?.close() } catch (_: Exception) {}
+                doc = null
             }
-            val stripper = PDFTextStripper()
-            stripper.setSortByPosition(true)
-            // دفعات أكبر تقلل عدد معاملات قاعدة البيانات وتسرّع فهرسة الكتب الكبيرة.
-            val buf = ArrayList<PageEntity>(40)
-            for (p in (done + 1)..total) {
+
+            val queue = readPending(pendingFile).distinct().sorted().toMutableList()
+            if (textOnly || queue.isEmpty()) {
+                pendingFile.delete()
+                dao.setProgress(bookId, total, ST_DONE)
+                return
+            }
+
+            dao.setProgress(bookId, total, ST_REFINING)
+            Work.refineLeft[bookId] = queue.size
+            val sem = Semaphore(workers)
+            val batchSize = maxOf(4, workers * 2)
+            while (queue.isNotEmpty()) {
                 currentCoroutineContext().ensureActive()
-                var text = ""
-                if (doc != null) {
-                    text = try {
-                        stripper.setStartPage(p)
-                        stripper.setEndPage(p)
-                        // احفظ النص المستخرج كما هو قدر الإمكان؛ التطبيع يقتصر على عمود البحث norm.
-                        stripper.getText(doc).replace("\u0000", "")
-                    } catch (e: Exception) {
-                        ""
+                val pl = ensurePool() ?: break
+                val batch = queue.take(batchSize)
+                val results = coroutineScope {
+                    batch.map { page ->
+                        async(Dispatchers.Default) {
+                            sem.withPermit { page to ocrPage(s, page - 1, opts.ocrWidth, pl) }
+                        }
+                    }.awaitAll()
+                }
+                val ents = ArrayList<PageEntity>()
+                for ((page, r) in results) {
+                    if (r.isNotBlank()) {
+                        val t = r.trim()
+                        ents.add(PageEntity(bookId = bookId, pageNo = page, text = t, norm = Arabic.normalize(t)))
                     }
                 }
-                if (Arabic.letterCount(text) < 15 && (autoOcr || forceOcr)) {
-                    val o = ocr(src, p - 1)
-                    if (o.isNotBlank()) text = o
-                }
-                buf.add(
-                    PageEntity(
-                        bookId = bookId,
-                        pageNo = p,
-                        text = text.trim(),
-                        norm = Arabic.normalize(text)
-                    )
-                )
-                if (buf.size >= 40 || p == total) {
-                    dao.insertPages(ArrayList(buf))
-                    buf.clear()
-                    dao.setProgress(bookId, p, if (p == total) ST_DONE else ST_INDEXING)
-                }
+                if (ents.isNotEmpty()) dao.updateMany(ents)
+                repeat(batch.size) { queue.removeAt(0) }
+                writePending(pendingFile, queue)
+                Work.refineLeft[bookId] = queue.size
             }
-            if (done >= total) dao.setProgress(bookId, total, ST_DONE)
+            pendingFile.delete()
+            Work.refineLeft.remove(bookId)
+            dao.setProgress(bookId, total, ST_DONE)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
+            Work.refineLeft.remove(bookId)
             dao.setStatus(bookId, ST_ERROR)
         } finally {
             try { doc?.close() } catch (_: Exception) {}
             src?.close()
-            try { tess?.recycle() } catch (_: Exception) {}
-            tess = null
+            pool?.close()
+        }
+    }
+}
+__EOF__
+mkdir -p "$(dirname "app/src/main/java/com/bahith/pdf/Service.kt")"
+cat > "app/src/main/java/com/bahith/pdf/Service.kt" <<'__EOF__'
+package com.bahith.pdf
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.Build
+import android.os.IBinder
+import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import androidx.compose.runtime.mutableStateMapOf
+import java.util.concurrent.ConcurrentHashMap
+
+/** مكان واحد لأعمال الفهرسة، يبقى حياً حتى لو أُغلقت الشاشة. */
+object Work {
+    val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    val lock = Mutex()
+    val jobs = ConcurrentHashMap<Long, Job>()
+
+    /** عدد الصفحات المتبقية لتحسين نصها بالـ OCR، لكل كتاب. */
+    val refineLeft = mutableStateMapOf<Long, Int>()
+
+    @Volatile
+    private var idx: Indexer? = null
+
+    fun indexer(ctx: Context): Indexer = idx ?: synchronized(this) {
+        idx ?: Indexer(ctx.applicationContext, AppDb.get(ctx).dao()).also { idx = it }
+    }
+}
+
+/** خدمة أمامية تُبقي التطبيق يعمل أثناء الفهرسة، وتتوقف وحدها عند الانتهاء. */
+class IndexService : Service() {
+    private var watcher: Job? = null
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val mgr = getSystemService(NotificationManager::class.java)
+        mgr.createNotificationChannel(
+            NotificationChannel("index", "الفهرسة", NotificationManager.IMPORTANCE_LOW)
+        )
+        val n = Notification.Builder(this, "index")
+            .setContentTitle("باحث PDF")
+            .setContentText("جارٍ فهرسة الكتب…")
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setOngoing(true)
+            .build()
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            } else {
+                startForeground(1, n)
+            }
+        } catch (e: Exception) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        if (watcher == null) {
+            val dao = AppDb.get(this).dao()
+            watcher = Work.scope.launch {
+                dao.observeBooks().collect { list ->
+                    val busy = list.any {
+                        it.status == ST_QUEUED || it.status == ST_INDEXING || it.status == ST_REFINING
+                    }
+                    if (!busy) stopSelf()
+                }
+            }
+        }
+        return START_NOT_STICKY
+    }
+
+    override fun onDestroy() {
+        watcher?.cancel()
+        watcher = null
+        super.onDestroy()
+    }
+
+    companion object {
+        fun start(ctx: Context) {
+            try {
+                ContextCompat.startForegroundService(ctx, Intent(ctx, IndexService::class.java))
+            } catch (e: Exception) {
+                // إن منع النظام الخدمة نكمل الفهرسة داخل التطبيق فقط
+            }
         }
     }
 }
@@ -609,6 +957,9 @@ cat > "app/src/main/java/com/bahith/pdf/Ui.kt" <<'__EOF__'
 package com.bahith.pdf
 
 import android.graphics.Bitmap
+import android.content.Intent
+import android.os.Build
+import android.speech.tts.TextToSpeech
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -665,11 +1016,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import java.util.Locale
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
 
-private val Mark = Color(0xFFFFD54F)
+val MARK_COLORS = listOf(Color(0xFFFFD54F), Color(0xFFA5D6A7), Color(0xFFF48FB1), Color(0xFF90CAF9))
+
+fun markColor(i: Int): Color = MARK_COLORS[i.coerceIn(0, MARK_COLORS.size - 1)]
 
 @Composable
 fun AppTheme(dark: Boolean, content: @Composable () -> Unit) {
@@ -715,12 +1069,29 @@ fun App(vm: AppViewModel = viewModel()) {
         CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
             val books by vm.books.collectAsStateWithLifecycle()
             val view = LocalView.current
-            val busy = books.any { it.status == ST_QUEUED || it.status == ST_INDEXING }
-            LaunchedEffect(busy, vm.keepAwake) { view.keepScreenOn = busy && vm.keepAwake }
+            val busy = books.any {
+                it.status == ST_QUEUED || it.status == ST_INDEXING || it.status == ST_REFINING
+            }
+            val reading = vm.reader != null
+            LaunchedEffect(busy, vm.keepAwake, reading, vm.keepAwakeRead) {
+                view.keepScreenOn = (busy && vm.keepAwake) || (reading && vm.keepAwakeRead)
+            }
+
+            val notifLauncher = rememberLauncherForActivityResult(
+                ActivityResultContracts.RequestPermission()
+            ) { }
+            LaunchedEffect(Unit) {
+                if (Build.VERSION.SDK_INT >= 33) {
+                    notifLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                }
+            }
 
             val picker = rememberLauncherForActivityResult(
                 ActivityResultContracts.OpenMultipleDocuments()
             ) { uris -> vm.importUris(uris) }
+            val treePicker = rememberLauncherForActivityResult(
+                ActivityResultContracts.OpenDocumentTree()
+            ) { uri -> if (uri != null) vm.importTree(uri) }
             val target = vm.reader
             BackHandler(enabled = target != null) { vm.reader = null }
 
@@ -749,21 +1120,18 @@ fun App(vm: AppViewModel = viewModel()) {
                                     icon = { Icon(Icons.Default.Settings, null) },
                                     label = { Text("الإعدادات") }
                                 )
-                                NavigationBarItem(
-                                    selected = vm.tab == 3,
-                                    onClick = { vm.tab = 3 },
-                                    icon = { Icon(Icons.Default.Add, null) },
-                                    label = { Text("المكتبة العامة") }
-                                )
                             }
                         }
                     ) { pad ->
                         Box(Modifier.padding(pad)) {
                             when (vm.tab) {
-                                0 -> LibraryScreen(vm) { picker.launch(arrayOf("application/pdf")) }
+                                0 -> LibraryScreen(
+                                    vm,
+                                    onAdd = { picker.launch(arrayOf("*/*")) },
+                                    onAddFolder = { treePicker.launch(null) }
+                                )
                                 1 -> SearchScreen(vm)
-                                2 -> SettingsScreen(vm)
-                                else -> PublicLibraryScreen(vm)
+                                else -> SettingsScreen(vm)
                             }
                         }
                     }
@@ -784,16 +1152,21 @@ fun App(vm: AppViewModel = viewModel()) {
 // ======================= المكتبة =======================
 
 @Composable
-fun LibraryScreen(vm: AppViewModel, onAdd: () -> Unit) {
+fun LibraryScreen(vm: AppViewModel, onAdd: () -> Unit, onAddFolder: () -> Unit) {
     val books by vm.books.collectAsStateWithLifecycle()
     var editing by remember { mutableStateOf<BookEntity?>(null) }
     var deleting by remember { mutableStateOf<BookEntity?>(null) }
-    val shown = remember(books, vm.libraryFilter, vm.sortOrder) {
-        arrangeBooks(books, vm.libraryFilter, vm.sortOrder)
+    val shown = remember(books, vm.libraryFilter, vm.sortOrder, vm.libFavOnly) {
+        arrangeBooks(books, vm.libraryFilter, vm.sortOrder).filter { !vm.libFavOnly || it.favorite }
     }
 
     Scaffold(
-        topBar = { CenterAlignedTopAppBar(title = { Text("باحث PDF") }) },
+        topBar = {
+            CenterAlignedTopAppBar(
+                title = { Text("باحث PDF") },
+                actions = { TextButton(onClick = onAddFolder) { Text("إضافة مجلد") } }
+            )
+        },
         floatingActionButton = {
             ExtendedFloatingActionButton(
                 onClick = onAdd,
@@ -803,6 +1176,18 @@ fun LibraryScreen(vm: AppViewModel, onAdd: () -> Unit) {
         }
     ) { pad ->
         Column(Modifier.padding(pad).fillMaxSize()) {
+            if (vm.importTotal > 0) {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
+                    LinearProgressIndicator(
+                        progress = { vm.importDone.toFloat() / vm.importTotal },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Text(
+                        "جارٍ إضافة الكتب… ${vm.importDone} / ${vm.importTotal}",
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                }
+            }
             if (books.isNotEmpty()) {
                 OutlinedTextField(
                     value = vm.libraryFilter,
@@ -827,6 +1212,11 @@ fun LibraryScreen(vm: AppViewModel, onAdd: () -> Unit) {
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text("${books.size} كتاب", style = MaterialTheme.typography.labelLarge)
+                    FilterChip(
+                        selected = vm.libFavOnly,
+                        onClick = { vm.libFavOnly = !vm.libFavOnly },
+                        label = { Text("المفضلة فقط") }
+                    )
                     listOf("الأحدث", "الاسم", "المفضلة أولاً").forEachIndexed { i, s ->
                         FilterChip(
                             selected = vm.sortOrder == i,
@@ -922,6 +1312,17 @@ fun BookCard(b: BookEntity, vm: AppViewModel, onEdit: () -> Unit, onDelete: () -
                             style = MaterialTheme.typography.labelMedium
                         )
                     }
+                    ST_REFINING -> {
+                        val left = Work.refineLeft[b.id]
+                        val frac = if (left != null && b.pageCount > 0) 1f - left.toFloat() / b.pageCount else 0f
+                        Text(
+                            "${b.pageCount} صفحة • جاهز للبحث • يُحسَّن النص بالـ OCR" +
+                                (if (left != null) " (متبقي $left)" else ""),
+                            style = MaterialTheme.typography.labelMedium
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        LinearProgressIndicator(progress = { frac }, modifier = Modifier.fillMaxWidth())
+                    }
                     ST_ERROR -> Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
                             "تعذّرت الفهرسة",
@@ -1011,9 +1412,14 @@ fun SearchScreen(vm: AppViewModel) {
     val books by vm.books.collectAsStateWithLifecycle()
     var showScope by remember { mutableStateOf(false) }
 
-    LaunchedEffect(vm.query, vm.mode, vm.scopeBookId, vm.resultLimit) {
-        delay(350)
-        vm.search()
+    LaunchedEffect(vm.query) {
+        if (vm.liveSearch || vm.query.isBlank()) {
+            delay(250)
+            vm.search()
+        }
+    }
+    LaunchedEffect(vm.mode, vm.scopeBookId, vm.resultLimit, vm.snippetLen) {
+        if (vm.query.isNotBlank()) vm.search()
     }
 
     val scopeName = if (vm.scopeBookId == 0L) "كل الكتب"
@@ -1029,7 +1435,7 @@ fun SearchScreen(vm: AppViewModel) {
                 leadingIcon = { Icon(Icons.Default.Search, null) },
                 trailingIcon = {
                     if (vm.query.isNotEmpty()) {
-                        IconButton(onClick = { vm.query = "" }) { Icon(Icons.Default.Close, "مسح") }
+                        IconButton(onClick = { vm.query = ""; vm.search() }) { Icon(Icons.Default.Close, "مسح") }
                     }
                 },
                 shape = RoundedCornerShape(24.dp),
@@ -1080,28 +1486,40 @@ fun SearchScreen(vm: AppViewModel) {
                     )
                 }
                 else -> {
-                    val shown = if (res.size >= vm.resultLimit) "${vm.resultLimit}+" else "${res.size}"
+                    val grouped = res.groupBy { it.bookId }
+                    var collapsed by remember(res) { mutableStateOf(setOf<Long>()) }
+                    val cap = if (res.size >= vm.resultLimit) "+" else ""
                     Text(
-                        "عدد الصفحات المطابقة: $shown",
+                        "${res.size}$cap نتيجة في ${grouped.size} كتاب",
                         Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
                         style = MaterialTheme.typography.labelMedium
                     )
-                    val grouped = res.groupBy { it.bookId }
                     LazyColumn(
                         Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(16.dp, 4.dp, 16.dp, 24.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        grouped.forEach { (_, hits) ->
+                        grouped.forEach { (bid, hits) ->
+                            val open = !collapsed.contains(bid)
                             item {
-                                Text(
-                                    "${hits.first().title}  (${hits.size})",
-                                    fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.padding(top = 8.dp)
-                                )
+                                Row(
+                                    Modifier.fillMaxWidth()
+                                        .clickable { collapsed = if (open) collapsed + bid else collapsed - bid }
+                                        .padding(top = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        hits.first().title + "  (" + hits.size + ")",
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    Text(if (open) "▾" else "◂", color = MaterialTheme.colorScheme.primary)
+                                }
                             }
-                            items(hits) { h -> HitCard(h) { vm.openHit(h) } }
+                            if (open) {
+                                items(hits) { h -> HitCard(h, markColor(vm.highlightIdx)) { vm.openHit(h) } }
+                            }
                         }
                     }
                 }
@@ -1153,17 +1571,17 @@ fun ScopeRow(label: String, onClick: () -> Unit) {
     )
 }
 
-fun highlighted(text: String, ranges: List<IntRange>): AnnotatedString = buildAnnotatedString {
+fun highlighted(text: String, ranges: List<IntRange>, color: Color = MARK_COLORS[0]): AnnotatedString = buildAnnotatedString {
     append(text)
     for (r in ranges) {
         val s = r.first.coerceIn(0, text.length)
         val e = (r.last + 1).coerceIn(s, text.length)
-        if (e > s) addStyle(SpanStyle(background = Mark, color = Color.Black), s, e)
+        if (e > s) addStyle(SpanStyle(background = color, color = Color.Black), s, e)
     }
 }
 
 @Composable
-fun HitCard(h: Hit, onClick: () -> Unit) {
+fun HitCard(h: Hit, color: Color, onClick: () -> Unit) {
     Card(
         onClick = onClick,
         modifier = Modifier.fillMaxWidth(),
@@ -1177,7 +1595,7 @@ fun HitCard(h: Hit, onClick: () -> Unit) {
             )
             Spacer(Modifier.height(4.dp))
             Text(
-                highlighted(h.snippet, h.ranges),
+                highlighted(h.snippet, h.ranges, color),
                 style = MaterialTheme.typography.bodyMedium,
                 lineHeight = 24.sp
             )
@@ -1241,6 +1659,8 @@ fun SettingsScreen(vm: AppViewModel) {
         ) {
             SettingsCard("المظهر") {
                 ChipRow(listOf("حسب النظام", "فاتح", "داكن"), vm.themeMode) { vm.updateTheme(it) }
+                Text("لون تظليل نتائج البحث")
+                ChipRow(listOf("أصفر", "أخضر", "وردي", "أزرق"), vm.highlightIdx) { vm.updateHighlight(it) }
                 Text("حجم خط القراءة (عرض النص): ${vm.readerFont.toInt()}")
                 Slider(
                     value = vm.readerFont,
@@ -1248,11 +1668,29 @@ fun SettingsScreen(vm: AppViewModel) {
                     onValueChangeFinished = { vm.saveFont() },
                     valueRange = 16f..34f
                 )
+                Text("تباعد الأسطر: ${"%.1f".format(vm.lineSpacing)}")
+                Slider(
+                    value = vm.lineSpacing,
+                    onValueChange = { vm.lineSpacing = it },
+                    onValueChangeFinished = { vm.saveReader() },
+                    valueRange = 1.2f..2.4f
+                )
+                Text("نوع الخط")
+                ChipRow(listOf("نسخ", "عادي"), vm.fontStyle) { vm.updateFontStyle(it) }
+                SwitchRow("إخفاء التشكيل في عرض النص", vm.hideTashkeel) { vm.updateHideTashkeel(it) }
+                SwitchRow("ضبط الفقرات (محاذاة الجانبين)", vm.justify) { vm.updateJustify(it) }
                 Text(
                     "بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ",
                     fontSize = vm.readerFont.sp,
-                    fontFamily = FontFamily.Serif
+                    fontFamily = if (vm.fontStyle == 0) FontFamily.Serif else FontFamily.SansSerif,
+                    textAlign = if (vm.justify) TextAlign.Justify else TextAlign.Start
                 )
+            }
+
+            SettingsCard("القراءة") {
+                Text("عند فتح نتيجة بحث")
+                ChipRow(listOf("نص الصفحة", "صورة الصفحة"), vm.hitView) { vm.updateHitView(it) }
+                SwitchRow("إبقاء الشاشة مفعّلة أثناء القراءة", vm.keepAwakeRead) { vm.updateKeepAwakeRead(it) }
             }
 
             SettingsCard("البحث") {
@@ -1266,11 +1704,55 @@ fun SettingsScreen(vm: AppViewModel) {
                     limits.map { "$it" },
                     limits.indexOf(vm.resultLimit).coerceAtLeast(0)
                 ) { vm.updateLimit(limits[it]) }
+                Text("طول مقتطف النتيجة")
+                ChipRow(listOf("قصير", "متوسط", "طويل"), vm.snippetLen) { vm.updateSnippetLen(it) }
+                SwitchRow("البحث أثناء الكتابة", vm.liveSearch) { vm.updateLiveSearch(it) }
+                SwitchRow("حفظ سجل البحث", vm.saveHistory) { vm.updateSaveHistory(it) }
+                Text("توحيد الحروف في البحث", fontWeight = FontWeight.Bold)
+                SwitchRow("التاء المربوطة = الهاء (ة = ه)", vm.normTa) {
+                    vm.updateNorm(it, vm.normAlef, vm.normHamza)
+                }
+                SwitchRow("الألف المقصورة = الياء (ى = ي)", vm.normAlef) {
+                    vm.updateNorm(vm.normTa, it, vm.normHamza)
+                }
+                SwitchRow("توحيد الهمزات (أ إ آ = ا ، ؤ = و ، ئ = ي)", vm.normHamza) {
+                    vm.updateNorm(vm.normTa, vm.normAlef, it)
+                }
+                Text(
+                    "بعد تغيير خيارات توحيد الحروف اضغط «تطبيق على الفهرس» ليشمل الكتب المفهرسة.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                TextButton(onClick = { vm.renormalize() }, enabled = !vm.renorming) {
+                    Text(if (vm.renorming) "جارٍ التطبيق…" else "تطبيق على الفهرس")
+                }
                 TextButton(onClick = { vm.clearHistory() }) { Text("مسح سجل البحث") }
             }
 
             SettingsCard("الفهرسة") {
-                SwitchRow("OCR تلقائي للصفحات التي بلا نص", vm.autoOcr) { vm.updateAutoOcr(it) }
+                Text("طريقة استخراج النص")
+                ChipRow(
+                    listOf("تلقائي (موصى به)", "OCR لكل الصفحات", "نص PDF فقط"),
+                    vm.extractMode
+                ) { vm.updateExtractMode(it) }
+                Text(
+                    "يصبح البحث متاحاً بسرعة من نص الملف، ثم تُحسَّن الصفحات التالفة بالـ OCR في الخلفية.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Text("سرعة الفهرسة (عدد المعالجات)")
+                ChipRow(listOf("1", "2", "3", "4", "5", "6"), vm.workers - 1) { vm.updateWorkers(it + 1) }
+                Text("جودة الـ OCR")
+                ChipRow(
+                    listOf("سريعة", "متوازنة", "عالية (نموذج أدق)"),
+                    vm.ocrQuality
+                ) { vm.updateOcrQuality(it) }
+                SwitchRow("تجاهل التشكيل أثناء قراءة OCR (أدق للحروف)", vm.ocrIgnoreMarks) {
+                    vm.updateOcrIgnoreMarks(it)
+                }
+                Text(
+                    "عدد أكبر وجودة أعلى = دقة أفضل لكن استهلاك أكثر للذاكرة والبطارية ووقت أطول. " +
+                        "تجاهل التشكيل يحسّن قراءة الحروف لكنه يزيل التشكيل من النص المقروء بالـ OCR.",
+                    style = MaterialTheme.typography.bodySmall
+                )
                 SwitchRow("إبقاء الشاشة مفعّلة أثناء الفهرسة", vm.keepAwake) { vm.updateKeepAwake(it) }
                 TextButton(onClick = { confirmReindex = true }) { Text("إعادة فهرسة كل الكتب") }
             }
@@ -1288,15 +1770,21 @@ fun SettingsScreen(vm: AppViewModel) {
 
             SettingsCard("سجل التغييرات") {
                 Text("الإصدار $APP_VERSION", fontWeight = FontWeight.Bold)
-                Text("• شاشة إعدادات: المظهر الداكن وحجم الخط ووضع البحث الافتراضي")
-                Text("• سجل بحث سابق للرجوع إليه بسرعة")
-                Text("• تعديل عنوان الكتاب والمؤلف")
-                Text("• المفضلة، وترتيب المكتبة وتصفيتها")
-                Text("• متابعة القراءة من آخر صفحة")
-                Text("• نسخ نص الصفحة من القارئ")
-                Text("• إبقاء الشاشة مفعّلة أثناء الفهرسة")
-                Text("• مكتبة عامة للبحث عن الكتب المفتوحة وتنزيل ملفات PDF وإضافتها للمكتبة المحلية")
-                Text("• تنزيل الكتاب ثم فهرسته للبحث المحلي دون إنترنت")
+                Text("• فهرسة بمرحلتين: بحث متاح بسرعة، وتحسين الـ OCR في الخلفية")
+                Text("• نموذج OCR أدق وجودة أعلى، وخيار تجاهل التشكيل لدقة الحروف")
+                Text("• تعديل نص أي صفحة يدوياً، وإعادة قراءة صفحة واحدة بالـ OCR الدقيق")
+                Text("• خيارات توحيد الحروف في البحث، وطول المقتطف، ولون التظليل")
+                Text("• البحث أثناء الكتابة أو عند الضغط، وحفظ السجل اختياري")
+                Text("• إضافة كتاب واحد مباشرة من الملفات، و«إضافة مجلد» في الأعلى")
+                Spacer(Modifier.height(6.dp))
+                Text("الإصدار 1.3", fontWeight = FontWeight.Bold)
+                Text("• إضافة من مجلد أو من «مشاركة» ملف PDF، وبحث داخل الكتاب، وعلامات")
+                Spacer(Modifier.height(6.dp))
+                Text("الإصدار 1.2", fontWeight = FontWeight.Bold)
+                Text("• اكتشاف النص التالف وقراءته بالـ OCR، وفهرسة متوازية وفي الخلفية")
+                Spacer(Modifier.height(6.dp))
+                Text("الإصدار 1.1", fontWeight = FontWeight.Bold)
+                Text("• الإعدادات، والمفضلة، وتعديل العنوان والمؤلف، وسجل البحث")
                 Spacer(Modifier.height(6.dp))
                 Text("الإصدار 1.0", fontWeight = FontWeight.Bold)
                 Text("• النسخة الأولى: مكتبة، وبحث، وفهرسة، وOCR عربي")
@@ -1356,69 +1844,227 @@ fun ReaderScreen(vm: AppViewModel, target: ReaderTarget) {
         initialPage = (target.page - 1).coerceIn(0, total - 1)
     ) { total }
     val scope = rememberCoroutineScope()
-    var textMode by remember { mutableStateOf(target.terms.isNotEmpty()) }
+    var textMode by remember { mutableStateOf(target.terms.isNotEmpty() && vm.hitView == 0) }
     var zoomed by remember { mutableStateOf(false) }
     var showGo by remember { mutableStateOf(false) }
+    var showMarks by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
+    var terms by remember { mutableStateOf(target.terms) }
+    var searchOpen by remember { mutableStateOf(false) }
+    var q by remember { mutableStateOf("") }
+    var hitPages by remember { mutableStateOf<List<Int>>(emptyList()) }
+    var hitIdx by remember { mutableIntStateOf(-1) }
+    var speaking by remember { mutableStateOf(false) }
+    var editing by remember { mutableStateOf<String?>(null) }
+
+    val tts = remember { mutableStateOf<TextToSpeech?>(null) }
+    DisposableEffect(Unit) {
+        var ref: TextToSpeech? = null
+        ref = TextToSpeech(ctx) { st ->
+            if (st == TextToSpeech.SUCCESS) ref?.language = Locale("ar")
+        }
+        tts.value = ref
+        onDispose {
+            ref?.stop()
+            ref?.shutdown()
+        }
+    }
 
     LaunchedEffect(pagerState.currentPage) {
         zoomed = false
         vm.saveLastPage(book.id, pagerState.currentPage + 1)
+        if (speaking) {
+            tts.value?.stop()
+            speaking = false
+        }
     }
 
-    val widthPx = (LocalConfiguration.current.screenWidthDp *
-        LocalDensity.current.density * 1.5f).toInt().coerceIn(800, 2000)
+    LaunchedEffect(q) {
+        delay(300)
+        val t = Arabic.terms(q)
+        if (t.isEmpty() || t.sumOf { it.length } < 2) {
+            hitPages = emptyList()
+            hitIdx = -1
+            terms = target.terms
+        } else {
+            val r = vm.searchInBook(book.id, q)
+            hitPages = r.first
+            terms = r.second
+            textMode = true
+            if (r.first.isEmpty()) {
+                hitIdx = -1
+            } else {
+                val cur = pagerState.currentPage + 1
+                val i = r.first.indexOfFirst { it >= cur }
+                hitIdx = if (i < 0) 0 else i
+                pagerState.scrollToPage(r.first[hitIdx] - 1)
+            }
+        }
+    }
+
+    fun goHit(delta: Int) {
+        if (hitPages.isEmpty()) return
+        hitIdx = (hitIdx + delta + hitPages.size) % hitPages.size
+        scope.launch { pagerState.scrollToPage(hitPages[hitIdx] - 1) }
+    }
+
+    fun toast(m: String) {
+        Toast.makeText(ctx, m, Toast.LENGTH_SHORT).show()
+    }
+
+    val curPage = pagerState.currentPage + 1
+    val marked = vm.isBookmarked(book.id, curPage)
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text(
-                            book.title,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            style = MaterialTheme.typography.titleMedium
-                        )
-                        Text(
-                            "صفحة ${pagerState.currentPage + 1} من $total",
-                            style = MaterialTheme.typography.labelSmall
-                        )
-                    }
-                },
-                navigationIcon = {
-                    IconButton(onClick = { vm.reader = null }) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "رجوع")
-                    }
-                },
-                actions = {
-                    TextButton(onClick = { textMode = !textMode }) {
-                        Text(if (textMode) "عرض الصفحة" else "عرض النص")
-                    }
-                    Box {
-                        IconButton(onClick = { menu = true }) {
-                            Icon(Icons.Default.MoreVert, "المزيد")
-                        }
-                        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                            DropdownMenuItem(
-                                text = { Text("الانتقال إلى صفحة") },
-                                onClick = { menu = false; showGo = true }
+            Column {
+                TopAppBar(
+                    title = {
+                        Column {
+                            Text(
+                                book.title,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                style = MaterialTheme.typography.titleMedium
                             )
-                            DropdownMenuItem(
-                                text = { Text("نسخ نص الصفحة") },
-                                onClick = {
-                                    menu = false
-                                    scope.launch {
-                                        val t = vm.pageText(book.id, pagerState.currentPage + 1)
-                                        clipboard.setText(AnnotatedString(t))
-                                        Toast.makeText(ctx, "تم نسخ نص الصفحة", Toast.LENGTH_SHORT).show()
+                            Text(
+                                "صفحة $curPage من $total" + if (marked) "  ★" else "",
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                        }
+                    },
+                    navigationIcon = {
+                        IconButton(onClick = { vm.reader = null }) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, "رجوع")
+                        }
+                    },
+                    actions = {
+                        IconButton(onClick = { searchOpen = !searchOpen }) {
+                            Icon(Icons.Default.Search, "بحث في الكتاب")
+                        }
+                        TextButton(onClick = { textMode = !textMode }) {
+                            Text(if (textMode) "الصفحة" else "النص")
+                        }
+                        Box {
+                            IconButton(onClick = { menu = true }) {
+                                Icon(Icons.Default.MoreVert, "المزيد")
+                            }
+                            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                                DropdownMenuItem(
+                                    text = { Text("الانتقال إلى صفحة") },
+                                    onClick = { menu = false; showGo = true }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text(if (marked) "إزالة العلامة من هذه الصفحة" else "إضافة علامة لهذه الصفحة") },
+                                    onClick = { menu = false; vm.toggleBookmark(book.id, curPage) }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("العلامات المحفوظة") },
+                                    onClick = { menu = false; showMarks = true }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("تكبير الخط") },
+                                    onClick = {
+                                        vm.readerFont = (vm.readerFont + 2f).coerceAtMost(40f)
+                                        vm.saveFont()
                                     }
-                                }
-                            )
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("تصغير الخط") },
+                                    onClick = {
+                                        vm.readerFont = (vm.readerFont - 2f).coerceAtLeast(14f)
+                                        vm.saveFont()
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("تعديل نص الصفحة") },
+                                    onClick = {
+                                        menu = false
+                                        scope.launch { editing = vm.pageText(book.id, curPage) }
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("إعادة قراءة الصفحة بالـ OCR الدقيق") },
+                                    onClick = {
+                                        menu = false
+                                        toast("جارٍ قراءة الصفحة…")
+                                        vm.reOcrPage(book.id, curPage) { ok ->
+                                            toast(if (ok) "تم تحديث نص الصفحة" else "تعذّرت القراءة")
+                                        }
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("نسخ نص الصفحة") },
+                                    onClick = {
+                                        menu = false
+                                        scope.launch {
+                                            val t = vm.pageText(book.id, curPage)
+                                            clipboard.setText(AnnotatedString(t))
+                                            toast("تم نسخ نص الصفحة")
+                                        }
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("مشاركة نص الصفحة") },
+                                    onClick = {
+                                        menu = false
+                                        scope.launch {
+                                            val t = vm.pageText(book.id, curPage)
+                                            val send = Intent(Intent.ACTION_SEND).apply {
+                                                type = "text/plain"
+                                                putExtra(Intent.EXTRA_TEXT, t)
+                                            }
+                                            ctx.startActivity(Intent.createChooser(send, "مشاركة نص الصفحة"))
+                                        }
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text(if (speaking) "إيقاف القراءة الصوتية" else "قراءة الصفحة صوتياً") },
+                                    onClick = {
+                                        menu = false
+                                        scope.launch {
+                                            if (speaking) {
+                                                tts.value?.stop()
+                                                speaking = false
+                                            } else {
+                                                val t = vm.pageText(book.id, curPage)
+                                                if (t.isBlank()) {
+                                                    toast("لا يوجد نص لهذه الصفحة")
+                                                } else {
+                                                    tts.value?.speak(t.take(3900), TextToSpeech.QUEUE_FLUSH, null, "page")
+                                                    speaking = true
+                                                }
+                                            }
+                                        }
+                                    }
+                                )
+                            }
                         }
+                    }
+                )
+                if (searchOpen) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedTextField(
+                            value = q,
+                            onValueChange = { q = it },
+                            modifier = Modifier.weight(1f),
+                            placeholder = { Text("ابحث في هذا الكتاب") },
+                            singleLine = true,
+                            shape = RoundedCornerShape(20.dp)
+                        )
+                        Text(
+                            if (hitPages.isEmpty()) (if (q.isBlank()) "" else "0") else "${hitIdx + 1}/${hitPages.size}",
+                            Modifier.padding(horizontal = 6.dp),
+                            style = MaterialTheme.typography.labelMedium
+                        )
+                        TextButton(onClick = { goHit(-1) }) { Text("السابق") }
+                        TextButton(onClick = { goHit(1) }) { Text("التالي") }
                     }
                 }
-            )
+            }
         }
     ) { pad ->
         HorizontalPager(
@@ -1427,13 +2073,58 @@ fun ReaderScreen(vm: AppViewModel, target: ReaderTarget) {
             modifier = Modifier.padding(pad).fillMaxSize()
         ) { idx ->
             if (textMode) {
-                TextPage(vm, book.id, idx + 1, target.terms)
+                TextPage(vm, book.id, idx + 1, terms)
             } else {
                 ZoomBox(onZoomChange = { zoomed = it }) {
-                    PdfPageImage(source, idx, widthPx)
+                    PdfPageImage(source, idx, (LocalConfiguration.current.screenWidthDp *
+                        LocalDensity.current.density * 1.5f).toInt().coerceIn(800, 2000))
                 }
             }
         }
+    }
+
+    editing?.let { cur ->
+        AlertDialog(
+            onDismissRequest = { editing = null },
+            title = { Text("تعديل نص الصفحة $curPage") },
+            text = {
+                OutlinedTextField(
+                    value = cur,
+                    onValueChange = { editing = it },
+                    modifier = Modifier.fillMaxWidth().height(320.dp)
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    vm.savePageText(book.id, curPage, cur)
+                    editing = null
+                }) { Text("حفظ") }
+            },
+            dismissButton = { TextButton(onClick = { editing = null }) { Text("إلغاء") } }
+        )
+    }
+
+    if (showMarks) {
+        val marks = vm.bookmarksOf(book.id)
+        AlertDialog(
+            onDismissRequest = { showMarks = false },
+            title = { Text("العلامات المحفوظة") },
+            text = {
+                if (marks.isEmpty()) {
+                    Text("لا توجد علامات. أضف علامة من القائمة (⋮).")
+                } else {
+                    Column(Modifier.verticalScroll(rememberScrollState())) {
+                        marks.forEach { pg ->
+                            ScopeRow("صفحة $pg") {
+                                showMarks = false
+                                scope.launch { pagerState.scrollToPage((pg - 1).coerceIn(0, total - 1)) }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { showMarks = false }) { Text("إغلاق") } }
+        )
     }
 
     if (showGo) {
@@ -1483,7 +2174,7 @@ fun PdfPageImage(source: PdfSource, index: Int, widthPx: Int) {
 
 @Composable
 fun TextPage(vm: AppViewModel, bookId: Long, pageNo: Int, terms: List<String>) {
-    val text by produceState<String?>(null, bookId, pageNo) {
+    val text by produceState<String?>(null, bookId, pageNo, vm.textVersion) {
         value = vm.pageText(bookId, pageNo)
     }
     val t = text
@@ -1491,16 +2182,18 @@ fun TextPage(vm: AppViewModel, bookId: Long, pageNo: Int, terms: List<String>) {
         when {
             t == null -> CircularProgressIndicator()
             t.isBlank() -> Text(
-                "لا يوجد نص لهذه الصفحة (لم تُفهرس بعد أو أنها فارغة). جرّب «عرض الصفحة».",
+                "لا يوجد نص لهذه الصفحة (لم تُفهرس بعد أو أنها فارغة). جرّب «الصفحة».",
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             else -> {
-                val ranges = remember(t, terms) { Arabic.findRanges(t, terms) }
+                val shown = if (vm.hideTashkeel) Arabic.stripTashkeel(t) else t
+                val ranges = remember(shown, terms) { Arabic.findRanges(shown, terms) }
                 Text(
-                    highlighted(t, ranges),
+                    highlighted(shown, ranges, markColor(vm.highlightIdx)),
                     fontSize = vm.readerFont.sp,
-                    lineHeight = (vm.readerFont * 1.7f).sp,
-                    fontFamily = FontFamily.Serif,
+                    lineHeight = (vm.readerFont * vm.lineSpacing).sp,
+                    fontFamily = if (vm.fontStyle == 0) FontFamily.Serif else FontFamily.SansSerif,
+                    textAlign = if (vm.justify) TextAlign.Justify else TextAlign.Start,
                     color = MaterialTheme.colorScheme.onBackground
                 )
             }
@@ -1575,6 +2268,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.sqlite.db.SimpleSQLiteQuery
@@ -1585,7 +2279,6 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -1600,7 +2293,7 @@ data class Hit(
 
 data class ReaderTarget(val bookId: Long, val page: Int, val terms: List<String>)
 
-const val APP_VERSION = "1.2"
+const val APP_VERSION = "1.4"
 
 fun arrangeBooks(list: List<BookEntity>, filter: String, sort: Int): List<BookEntity> {
     val f = Arabic.normalize(filter)
@@ -1624,9 +2317,6 @@ fun formatSize(bytes: Long): String {
 class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private val dao = AppDb.get(app).dao()
-    private val indexer = Indexer(app, dao)
-    private val indexLock = Mutex()
-    private val jobs = mutableMapOf<Long, Job>()
     private var searchJob: Job? = null
     private val prefs = app.getSharedPreferences("settings", Context.MODE_PRIVATE)
 
@@ -1640,8 +2330,33 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         SearchMode.values()[prefs.getInt("mode", 0).coerceIn(0, SearchMode.values().size - 1)]
     )
     var resultLimit by mutableIntStateOf(prefs.getInt("limit", 400))
-    // OCR أبطأ وأقل دقة من النص الأصلي المضمّن في PDF؛ لا نشغله تلقائياً دون طلب المستخدم.
-    var autoOcr by mutableStateOf(prefs.getBoolean("autoOcr", false))
+    var extractMode by mutableIntStateOf(prefs.getInt("extract", 0))
+    var workers by mutableIntStateOf(
+        prefs.getInt("workers", minOf(4, maxOf(2, Runtime.getRuntime().availableProcessors() / 2)))
+    )
+    var ocrQuality by mutableIntStateOf(prefs.getInt("ocrq", 1))
+    var hitView by mutableIntStateOf(prefs.getInt("hitview", 0))
+    var lineSpacing by mutableFloatStateOf(prefs.getFloat("lineSp", 1.7f))
+    var hideTashkeel by mutableStateOf(prefs.getBoolean("hideTash", false))
+    var justify by mutableStateOf(prefs.getBoolean("justify", false))
+    var fontStyle by mutableIntStateOf(prefs.getInt("fontStyle", 0))
+    var importTotal by mutableIntStateOf(0)
+    var importDone by mutableIntStateOf(0)
+    var libFavOnly by mutableStateOf(false)
+    var ocrIgnoreMarks by mutableStateOf(prefs.getBoolean("ocrNoMarks", false))
+    var normTa by mutableStateOf(prefs.getBoolean("normTa", true))
+    var normAlef by mutableStateOf(prefs.getBoolean("normAlef", true))
+    var normHamza by mutableStateOf(prefs.getBoolean("normHamza", true))
+    var snippetLen by mutableIntStateOf(prefs.getInt("snippet", 1))
+    var liveSearch by mutableStateOf(prefs.getBoolean("live", true))
+    var saveHistory by mutableStateOf(prefs.getBoolean("saveHist", true))
+    var highlightIdx by mutableIntStateOf(prefs.getInt("hl", 0))
+    var keepAwakeRead by mutableStateOf(prefs.getBoolean("awakeRead", false))
+    var textVersion by mutableIntStateOf(0)
+    var renorming by mutableStateOf(false)
+    var bookmarks by mutableStateOf(
+        (prefs.getString("bookmarks", "") ?: "").split("\n").filter { it.contains(":") }.toSet()
+    )
     var keepAwake by mutableStateOf(prefs.getBoolean("keepAwake", true))
     var sortOrder by mutableIntStateOf(prefs.getInt("sort", 0))
     var history by mutableStateOf(
@@ -1656,13 +2371,113 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         prefs.edit().putInt("mode", m.ordinal).apply()
     }
     fun updateLimit(v: Int) { resultLimit = v; prefs.edit().putInt("limit", v).apply() }
-    fun updateAutoOcr(v: Boolean) { autoOcr = v; prefs.edit().putBoolean("autoOcr", v).apply() }
+    fun updateExtractMode(v: Int) { extractMode = v; prefs.edit().putInt("extract", v).apply() }
+    fun updateWorkers(v: Int) { workers = v; prefs.edit().putInt("workers", v).apply() }
+    fun updateOcrQuality(v: Int) { ocrQuality = v; prefs.edit().putInt("ocrq", v).apply() }
+    fun saveReader() { prefs.edit().putFloat("lineSp", lineSpacing).putFloat("font", readerFont).apply() }
+    fun updateHideTashkeel(v: Boolean) { hideTashkeel = v; prefs.edit().putBoolean("hideTash", v).apply() }
+    fun updateJustify(v: Boolean) { justify = v; prefs.edit().putBoolean("justify", v).apply() }
+    fun updateFontStyle(v: Int) { fontStyle = v; prefs.edit().putInt("fontStyle", v).apply() }
+
+    fun isBookmarked(bookId: Long, page: Int): Boolean = bookmarks.contains("$bookId:$page")
+
+    fun toggleBookmark(bookId: Long, page: Int) {
+        val k = "$bookId:$page"
+        bookmarks = if (bookmarks.contains(k)) bookmarks - k else bookmarks + k
+        prefs.edit().putString("bookmarks", bookmarks.joinToString("\n")).apply()
+    }
+
+    fun bookmarksOf(bookId: Long): List<Int> =
+        bookmarks.filter { it.startsWith("$bookId:") }
+            .mapNotNull { it.substringAfter(":").toIntOrNull() }.sorted()
+
+    private fun dropBookmarks(bookId: Long?) {
+        bookmarks = if (bookId == null) emptySet()
+        else bookmarks.filterNot { it.startsWith("$bookId:") }.toSet()
+        prefs.edit().putString("bookmarks", bookmarks.joinToString("\n")).apply()
+    }
+
+    fun updateHitView(v: Int) { hitView = v; prefs.edit().putInt("hitview", v).apply() }
+
+    private fun options(): IndexOptions {
+        val width = when (ocrQuality) {
+            0 -> 1400
+            2 -> 2400
+            else -> 1900
+        }
+        return IndexOptions(extractMode, workers, width, ocrQuality == 2, ocrIgnoreMarks)
+    }
+
+    fun updateOcrIgnoreMarks(v: Boolean) { ocrIgnoreMarks = v; prefs.edit().putBoolean("ocrNoMarks", v).apply() }
+    fun updateSnippetLen(v: Int) { snippetLen = v; prefs.edit().putInt("snippet", v).apply() }
+    fun updateLiveSearch(v: Boolean) { liveSearch = v; prefs.edit().putBoolean("live", v).apply() }
+    fun updateSaveHistory(v: Boolean) { saveHistory = v; prefs.edit().putBoolean("saveHist", v).apply() }
+    fun updateHighlight(v: Int) { highlightIdx = v; prefs.edit().putInt("hl", v).apply() }
+    fun updateKeepAwakeRead(v: Boolean) { keepAwakeRead = v; prefs.edit().putBoolean("awakeRead", v).apply() }
+
+    fun updateNorm(ta: Boolean, alef: Boolean, hamza: Boolean) {
+        normTa = ta; normAlef = alef; normHamza = hamza
+        ArabicOpts.taMarbuta = ta
+        ArabicOpts.alefMaksura = alef
+        ArabicOpts.hamza = hamza
+        prefs.edit().putBoolean("normTa", ta).putBoolean("normAlef", alef).putBoolean("normHamza", hamza).apply()
+    }
+
+    /** إعادة بناء عمود البحث لكل الصفحات بعد تغيير خيارات توحيد الحروف (سريع، دون OCR). */
+    fun renormalize() {
+        if (renorming) return
+        viewModelScope.launch(Dispatchers.Default) {
+            renorming = true
+            try {
+                var last = 0L
+                while (true) {
+                    val b = dao.textBatch(last, 300)
+                    if (b.isEmpty()) break
+                    dao.renormBatch(b)
+                    last = b.last().id
+                }
+                message = "تم تطبيق خيارات البحث على الفهرس"
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                message = "تعذّر تحديث الفهرس"
+            } finally {
+                renorming = false
+            }
+        }
+    }
+
+    // ---------- تعديل نص الصفحة ----------
+    fun savePageText(bookId: Long, pageNo: Int, text: String) {
+        viewModelScope.launch {
+            val t = text.trim()
+            dao.updatePage(bookId, pageNo, t, Arabic.normalize(t))
+            textVersion++
+        }
+    }
+
+    /** يعيد قراءة صفحة واحدة بالـ OCR الأدق ويحفظ النتيجة. */
+    fun reOcrPage(bookId: Long, pageNo: Int, done: (Boolean) -> Unit) {
+        viewModelScope.launch {
+            val app = getApplication<Application>()
+            val t = withContext(Dispatchers.Default) {
+                Work.indexer(app).ocrOne(bookId, pageNo, ocrIgnoreMarks)
+            }
+            if (t.isBlank()) {
+                done(false)
+            } else {
+                dao.updatePage(bookId, pageNo, t.trim(), Arabic.normalize(t))
+                textVersion++
+                done(true)
+            }
+        }
+    }
     fun updateKeepAwake(v: Boolean) { keepAwake = v; prefs.edit().putBoolean("keepAwake", v).apply() }
     fun updateSort(v: Int) { sortOrder = v; prefs.edit().putInt("sort", v).apply() }
 
     fun addHistory(q: String) {
         val t = q.trim()
-        if (t.length < 2) return
+        if (t.length < 2 || !saveHistory) return
         history = (listOf(t) + history.filter { it != t }).take(12)
         prefs.edit().putString("history", history.joinToString("\n")).apply()
     }
@@ -1678,15 +2493,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var message by mutableStateOf<String?>(null)
     var libraryFilter by mutableStateOf("")
 
-    // ---------- المكتبة العامة: فهرس Internet Archive المفتوح ----------
-    var catalogQuery by mutableStateOf("")
-    var catalogResults by mutableStateOf<List<CatalogItem>>(emptyList())
-    var catalogLoading by mutableStateOf(false)
-    var catalogError by mutableStateOf<String?>(null)
-    var downloadingId by mutableStateOf<String?>(null)
-    var downloadProgress by mutableIntStateOf(0)
-    private var catalogJob: Job? = null
-
     var query by mutableStateOf("")
     var mode by mutableStateOf(defaultMode)
     var scopeBookId by mutableLongStateOf(0L)
@@ -1696,8 +2502,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var lastTerms: List<String> = emptyList()
 
     init {
+        ArabicOpts.taMarbuta = normTa
+        ArabicOpts.alefMaksura = normAlef
+        ArabicOpts.hamza = normHamza
         viewModelScope.launch {
-            dao.unfinished().forEach { startIndex(it.id) }
+            dao.unfinished().forEach {
+                if (Work.jobs[it.id]?.isActive != true) startIndex(it.id)
+            }
         }
     }
 
@@ -1706,12 +2517,51 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------- إضافة الكتب ----------
     fun importUris(uris: List<Uri>) {
+        if (uris.isEmpty()) return
         viewModelScope.launch {
+            importTotal += uris.size
+            var added = 0
+            var dup = 0
             for (uri in uris) {
                 val id = withContext(Dispatchers.IO) { copyIn(uri) }
-                if (id != null) startIndex(id)
+                importDone += 1
+                if (id == null) {
+                    // فشل نسخ الملف وظهرت رسالة
+                } else if (id < 0) {
+                    dup++
+                } else {
+                    added++
+                    startIndex(id)
+                }
+            }
+            if (importDone >= importTotal) {
+                importTotal = 0
+                importDone = 0
+            }
+            if (uris.size > 1 || dup > 0) {
+                message = "تمت إضافة $added كتاب" + if (dup > 0) " وتخطي $dup مكرّر" else ""
             }
         }
+    }
+
+    fun importTree(tree: Uri) {
+        viewModelScope.launch {
+            val app = getApplication<Application>()
+            val uris = withContext(Dispatchers.IO) { collectPdfs(DocumentFile.fromTreeUri(app, tree)) }
+            if (uris.isEmpty()) message = "لم أجد ملفات PDF في هذا المجلد" else importUris(uris)
+        }
+    }
+
+    private fun collectPdfs(dir: DocumentFile?): List<Uri> {
+        val out = ArrayList<Uri>()
+        dir?.listFiles()?.forEach { f ->
+            if (f.isDirectory) {
+                out.addAll(collectPdfs(f))
+            } else if (f.type == "application/pdf" || f.name?.endsWith(".pdf", true) == true) {
+                out.add(f.uri)
+            }
+        }
+        return out
     }
 
     private suspend fun copyIn(uri: Uri): Long? {
@@ -1728,19 +2578,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val f = File(booksDir(), "$id.pdf")
         return try {
             ctx.contentResolver.openInputStream(uri)!!.use { i ->
-                f.outputStream().buffered(1024 * 1024).use { o ->
-                    val buffer = ByteArray(1024 * 1024)
-                    while (true) {
-                        val n = i.read(buffer)
-                        if (n < 0) break
-                        o.write(buffer, 0, n)
-                    }
-                    o.flush()
-                }
+                f.outputStream().use { o -> i.copyTo(o) }
             }
             val count = PdfSource(f).use { it.pageCount }
-            dao.setPageCount(id, count)
-            id
+            val dup = dao.allBooks().any { it.id != id && it.title == title && it.pageCount == count }
+            if (dup) {
+                f.delete()
+                dao.deleteBookFully(id)
+                -1L
+            } else {
+                dao.setPageCount(id, count)
+                id
+            }
         } catch (e: Exception) {
             f.delete()
             dao.deleteBookFully(id)
@@ -1750,10 +2599,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun startIndex(id: Long, forceOcr: Boolean = false, restart: Boolean = false) {
-        jobs[id]?.cancel()
-        val auto = autoOcr
-        jobs[id] = viewModelScope.launch(Dispatchers.Default) {
-            indexLock.withLock { indexer.index(id, forceOcr, restart, auto) }
+        Work.jobs[id]?.cancel()
+        val opts = options()
+        val app = getApplication<Application>()
+        Work.jobs[id] = Work.scope.launch {
+            if (restart || forceOcr) dao.setStatus(id, ST_QUEUED)
+            IndexService.start(app)
+            Work.lock.withLock { Work.indexer(app).index(id, forceOcr, restart, opts) }
         }
     }
 
@@ -1778,24 +2630,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun delete(id: Long) {
         viewModelScope.launch {
-            jobs.remove(id)?.cancelAndJoin()
+            Work.jobs.remove(id)?.cancelAndJoin()
             withContext(Dispatchers.IO) {
                 dao.deleteBookFully(id)
                 File(booksDir(), "$id.pdf").delete()
             }
+            dropBookmarks(id)
             if (scopeBookId == id) scopeBookId = 0L
         }
     }
 
     fun deleteAll() {
         viewModelScope.launch {
-            jobs.values.toList().forEach { it.cancelAndJoin() }
-            jobs.clear()
+            Work.jobs.values.toList().forEach { it.cancelAndJoin() }
+            Work.jobs.clear()
             withContext(Dispatchers.IO) {
                 dao.deleteAllPages()
                 dao.deleteAllBooks()
                 booksDir().listFiles()?.forEach { it.delete() }
             }
+            dropBookmarks(null)
             scopeBookId = 0L
             results = emptyList()
             searchedOnce = false
@@ -1806,66 +2660,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val files = booksDir().listFiles()?.sumOf { it.length() } ?: 0L
         val db = getApplication<Application>().getDatabasePath("bahith.db").length()
         files + db
-    }
-
-    // ---------- البحث والتنزيل من المكتبة العامة ----------
-    fun searchCatalog() {
-        val q = catalogQuery.trim()
-        if (q.length < 2) {
-            catalogError = "اكتب كلمتين على الأقل للبحث في فهرس الكتب."
-            catalogResults = emptyList()
-            return
-        }
-        catalogJob?.cancel()
-        catalogJob = viewModelScope.launch {
-            catalogLoading = true
-            catalogError = null
-            try {
-                catalogResults = withContext(Dispatchers.IO) { ArchiveCatalog.search(q) }
-                if (catalogResults.isEmpty()) catalogError = "لم يُعثر على كتب PDF مطابقة. جرّب عبارة أخرى."
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                catalogError = "تعذّر الاتصال بفهرس المكتبة العامة: ${e.message ?: "خطأ اتصال"}"
-            } finally {
-                catalogLoading = false
-            }
-        }
-    }
-
-    fun downloadCatalogBook(item: CatalogItem) {
-        if (downloadingId != null) {
-            message = "يوجد تنزيل جارٍ. انتظر حتى ينتهي قبل بدء تنزيل آخر."
-            return
-        }
-        viewModelScope.launch {
-            downloadingId = item.identifier
-            downloadProgress = 0
-            var temp: File? = null
-            try {
-                val result = withContext(Dispatchers.IO) { ArchiveCatalog.downloadPdf(item) { p -> downloadProgress = p } }
-                temp = result
-                val pageCount = withContext(Dispatchers.IO) { PdfSource(result).use { it.pageCount } }
-                if (pageCount <= 0) throw IllegalStateException("الملف لا يحتوي على صفحات PDF صالحة")
-                val id = dao.insertBook(BookEntity(title = item.title, author = item.creator))
-                val destination = File(booksDir(), "$id.pdf")
-                withContext(Dispatchers.IO) {
-                    if (!result.renameTo(destination)) result.copyTo(destination, overwrite = true)
-                    if (result.exists()) result.delete()
-                }
-                dao.setPageCount(id, pageCount)
-                startIndex(id)
-                message = "تم تنزيل «${item.title}» وإضافته إلى مكتبتك. ستبدأ فهرسته للبحث دون إنترنت."
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                temp?.delete()
-                catalogError = "فشل تنزيل الكتاب: ${e.message ?: "خطأ غير معروف"}"
-            } finally {
-                downloadingId = null
-                downloadProgress = 0
-            }
-        }
     }
 
     // ---------- البحث ----------
@@ -1881,9 +2675,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val m = mode
         val scope = scopeBookId
         val limit = resultLimit
+        val radius = when (snippetLen) {
+            0 -> 50
+            2 -> 150
+            else -> 80
+        }
         searchJob = viewModelScope.launch {
             searching = true
-            val out = withContext(Dispatchers.Default) { runSearch(terms, m, scope, limit) }
+            val out = withContext(Dispatchers.Default) { runSearch(terms, m, scope, limit, radius) }
             lastTerms = out.second
             results = out.first
             searchedOnce = true
@@ -1895,7 +2694,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         terms: List<String>,
         m: SearchMode,
         scope: Long,
-        limit: Int
+        limit: Int,
+        radius: Int
     ): Pair<List<Hit>, List<String>> {
         val match = Arabic.ftsQuery(terms, m)
         val hl = if (m == SearchMode.PHRASE) listOf(terms.joinToString(" ")) else terms
@@ -1919,10 +2719,31 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             emptyList()
         }
         val hits = rows.map {
-            val (snip, ranges) = Arabic.snippet(it.text, hl)
+            val (snip, ranges) = Arabic.snippet(it.text, hl, radius)
             Hit(it.bookId, it.title, it.pageNo, snip, ranges)
         }
         return hits to hl
+    }
+
+    /** أرقام الصفحات المطابقة داخل كتاب واحد (للبحث من القارئ). */
+    suspend fun searchInBook(bookId: Long, q: String): Pair<List<Int>, List<String>> {
+        val terms = Arabic.terms(q)
+        if (terms.isEmpty()) return Pair(emptyList(), emptyList())
+        val m = if (terms.size >= 6) SearchMode.PHRASE else SearchMode.ALL
+        val hl = if (m == SearchMode.PHRASE) listOf(terms.joinToString(" ")) else terms
+        val sql = "SELECT p.bookId AS bookId, p.pageNo AS pageNo, '' AS text, '' AS title " +
+            "FROM pages_fts JOIN pages p ON p.id = pages_fts.rowid " +
+            "WHERE pages_fts MATCH ? AND p.bookId = ? ORDER BY p.pageNo LIMIT 3000"
+        val rows = try {
+            withContext(Dispatchers.Default) {
+                dao.search(SimpleSQLiteQuery(sql, arrayOf<Any>(Arabic.ftsQuery(terms, m), bookId)))
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            emptyList()
+        }
+        return Pair(rows.map { it.pageNo }, hl)
     }
 
     fun openHit(h: Hit) {
@@ -2009,199 +2830,6 @@ dependencyResolutionManagement {
 rootProject.name = "BahithPDF"
 include(":app")
 __EOF__
-
-mkdir -p "$(dirname "app/src/main/java/com/bahith/pdf/PublicLibrary.kt")"
-cat > "app/src/main/java/com/bahith/pdf/PublicLibrary.kt" <<'__EOF__'
-package com.bahith.pdf
-
-import android.net.Uri
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import org.json.JSONObject
-import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
-
-/** نتيجة من فهرس الكتب المفتوحة في Internet Archive. */
-data class CatalogItem(
-    val identifier: String,
-    val title: String,
-    val creator: String,
-    val year: String,
-    val downloads: String
-)
-
-/**
- * موصل أولي لفهرس Internet Archive العام. لا يفترض أن كل عنصر مجاني لإعادة النشر؛
- * يجب على المستخدم مراجعة صفحة المصدر وبيانات الحقوق قبل الاستخدام أو إعادة التوزيع.
- */
-object ArchiveCatalog {
-    private fun get(url: String): String {
-        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 15000
-            readTimeout = 30000
-            requestMethod = "GET"
-            setRequestProperty("User-Agent", "BahithPDF/1.2 (Android; public catalog search)")
-        }
-        try {
-            val code = connection.responseCode
-            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
-            val body = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
-            if (code !in 200..299) throw IllegalStateException("HTTP $code")
-            return body
-        } finally {
-            connection.disconnect()
-        }
-    }
-
-    suspend fun search(query: String): List<CatalogItem> = withContext(Dispatchers.IO) {
-        val encoded = Uri.encode(query)
-        val url = "https://archive.org/advancedsearch.php?q=$encoded%20AND%20mediatype%3Atexts&fl%5B%5D=identifier&fl%5B%5D=title&fl%5B%5D=creator&fl%5B%5D=year&fl%5B%5D=downloads&rows=30&page=1&output=json"
-        val root = JSONObject(get(url))
-        val docs = root.optJSONObject("response")?.optJSONArray("docs") ?: return@withContext emptyList()
-        buildList {
-            for (i in 0 until docs.length()) {
-                val d = docs.optJSONObject(i) ?: continue
-                val id = d.optString("identifier").trim()
-                val title = d.optString("title").trim()
-                if (id.isBlank() || title.isBlank()) continue
-                add(CatalogItem(
-                    identifier = id,
-                    title = title,
-                    creator = d.optString("creator").takeUnless { it == "null" } ?: "",
-                    year = d.optString("year").takeUnless { it == "null" } ?: "",
-                    downloads = d.optString("downloads").takeUnless { it == "null" } ?: ""
-                ))
-            }
-        }
-    }
-
-    suspend fun downloadPdf(item: CatalogItem, onProgress: (Int) -> Unit): File = withContext(Dispatchers.IO) {
-        val metadata = JSONObject(get("https://archive.org/metadata/${Uri.encode(item.identifier)}"))
-        val files = metadata.optJSONArray("files") ?: throw IllegalStateException("لا توجد قائمة ملفات للمصدر")
-        var pdfName: String? = null
-        for (i in 0 until files.length()) {
-            val f = files.optJSONObject(i) ?: continue
-            val name = f.optString("name")
-            val format = f.optString("format")
-            if (name.endsWith(".pdf", true) || format.equals("pdf", true)) {
-                pdfName = name
-                break
-            }
-        }
-        val chosen = pdfName ?: throw IllegalStateException("هذا السجل لا يوفر ملف PDF قابلاً للتنزيل")
-        val encodedName = chosen.split("/").joinToString("/") { Uri.encode(it) }
-        val downloadUrl = "https://archive.org/download/${Uri.encode(item.identifier)}/$encodedName"
-        val connection = (URL(downloadUrl).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 20000
-            readTimeout = 60000
-            setRequestProperty("User-Agent", "BahithPDF/1.2 (Android)")
-        }
-        val out = File.createTempFile("bahith_catalog_", ".part")
-        try {
-            val code = connection.responseCode
-            if (code !in 200..299) throw IllegalStateException("تعذّر جلب ملف PDF: HTTP $code")
-            val total = connection.contentLengthLong
-            connection.inputStream.use { input ->
-                out.outputStream().buffered().use { output ->
-                    val buffer = ByteArray(64 * 1024)
-                    var count: Int
-                    var received = 0L
-                    while (input.read(buffer).also { count = it } >= 0) {
-                        if (count == 0) continue
-                        output.write(buffer, 0, count)
-                        received += count
-                        if (total > 0) onProgress(((received * 100) / total).toInt().coerceIn(0, 99))
-                    }
-                }
-            }
-            if (out.length() < 1000L) throw IllegalStateException("الملف المستلم صغير أو غير صالح")
-            onProgress(100)
-            out
-        } catch (e: Exception) {
-            out.delete()
-            throw e
-        } finally {
-            connection.disconnect()
-        }
-    }
-}
-
-@Composable
-fun PublicLibraryScreen(vm: AppViewModel) {
-    Column(Modifier.fillMaxSize().padding(16.dp)) {
-        Text("المكتبة العامة", style = MaterialTheme.typography.headlineSmall)
-        Spacer(Modifier.height(6.dp))
-        Text(
-            "ابحث في فهرس Internet Archive عن الكتب المتاحة، ثم نزّل ملف PDF ليُحفظ داخل التطبيق ويُفهرس للبحث دون إنترنت.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        Spacer(Modifier.height(12.dp))
-        OutlinedTextField(
-            value = vm.catalogQuery,
-            onValueChange = { vm.catalogQuery = it },
-            modifier = Modifier.fillMaxWidth(),
-            label = { Text("عنوان الكتاب أو المؤلف أو الموضوع") },
-            singleLine = true
-        )
-        Button(
-            onClick = { vm.searchCatalog() },
-            enabled = !vm.catalogLoading && vm.catalogQuery.trim().length >= 2,
-            modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
-        ) { Text("البحث في المكتبة العامة") }
-        if (vm.catalogLoading) {
-            LinearProgressIndicator(Modifier.fillMaxWidth().padding(top = 8.dp))
-        }
-        if (vm.downloadingId != null) {
-            Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-                Text("جارٍ تنزيل الكتاب… ${vm.downloadProgress}%")
-                LinearProgressIndicator(
-                    progress = { vm.downloadProgress / 100f },
-                    modifier = Modifier.fillMaxWidth()
-                )
-            }
-        }
-        vm.catalogError?.let {
-            Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(vertical = 8.dp))
-        }
-        LazyColumn(
-            modifier = Modifier.weight(1f),
-            contentPadding = PaddingValues(vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            items(vm.catalogResults, key = { it.identifier }) { item ->
-                Card(Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(12.dp)) {
-                        Text(item.title, style = MaterialTheme.typography.titleMedium)
-                        if (item.creator.isNotBlank()) Text("المؤلف: ${item.creator}", style = MaterialTheme.typography.bodySmall)
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            if (item.year.isNotBlank()) Text("السنة: ${item.year}  ", style = MaterialTheme.typography.labelSmall)
-                            if (item.downloads.isNotBlank()) Text("التنزيلات: ${item.downloads}", style = MaterialTheme.typography.labelSmall)
-                        }
-                        Text("المصدر: Internet Archive • راجع حقوق الكتاب قبل إعادة نشره.", style = MaterialTheme.typography.labelSmall)
-                        TextButton(
-                            onClick = { vm.downloadCatalogBook(item) },
-                            enabled = vm.downloadingId == null
-                        ) { Text("تنزيل PDF وإضافته إلى مكتبتي") }
-                    }
-                }
-            }
-        }
-        Text(
-            "تنبيه: توفر الكتاب في الفهرس لا يعني بالضرورة أن حقوق إعادة نشره متاحة. بعد التنزيل يمكنك البحث فيه دون إنترنت، أما تصفح الفهرس والتنزيل فيحتاجان إلى اتصال.",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-    }
-}
-__EOF__
+mkdir -p app/src/main/assets/tessdata
+curl -L --fail --retry 3 -o app/src/main/assets/tessdata/ara_best.traineddata https://github.com/tesseract-ocr/tessdata_best/raw/main/ara.traineddata || echo "best model download failed (optional)"
+ls -l app/src/main/assets/tessdata || true
