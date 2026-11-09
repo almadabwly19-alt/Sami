@@ -17,8 +17,8 @@ android {
         applicationId = "com.bahith.pdf"
         minSdk = 26
         targetSdk = 34
-        versionCode = 3
-        versionName = "1.2"
+        versionCode = 4
+        versionName = "1.3"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
 
@@ -56,6 +56,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
 
+    implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("androidx.room:room-runtime:2.6.1")
     implementation("androidx.room:room-ktx:2.6.1")
     ksp("androidx.room:room-compiler:2.6.1")
@@ -137,10 +138,27 @@ cat > "app/src/main/AndroidManifest.xml" <<'__EOF__'
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTop"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:mimeType="application/pdf" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/pdf" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/pdf" />
             </intent-filter>
         </activity>
     </application>
@@ -207,6 +225,16 @@ object Arabic {
 
     fun terms(q: String): List<String> =
         normalize(q).split(' ').filter { it.isNotEmpty() }
+
+    /** يزيل التشكيل والتطويل فقط (للعرض). */
+    fun stripTashkeel(s: String): String {
+        val sb = StringBuilder(s.length)
+        for (c in s) {
+            if (Character.getType(c) == Character.NON_SPACING_MARK.toInt() || c == 'ـ') continue
+            sb.append(c)
+        }
+        return sb.toString()
+    }
 
     fun letterCount(s: String): Int = s.count { it.isLetter() }
 
@@ -427,14 +455,41 @@ mkdir -p "$(dirname "app/src/main/java/com/bahith/pdf/MainActivity.kt")"
 cat > "app/src/main/java/com/bahith/pdf/MainActivity.kt" <<'__EOF__'
 package com.bahith.pdf
 
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.viewModels
 
 class MainActivity : ComponentActivity() {
+    private val vm: AppViewModel by viewModels()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent { App() }
+        if (savedInstanceState == null) handleIntent(intent)
+        setContent { App(vm) }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleIntent(intent)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun handleIntent(i: Intent?) {
+        if (i == null) return
+        val uris = ArrayList<Uri>()
+        when (i.action) {
+            Intent.ACTION_VIEW -> i.data?.let { uris.add(it) }
+            Intent.ACTION_SEND -> i.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)?.let { uris.add(it) }
+            Intent.ACTION_SEND_MULTIPLE ->
+                i.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)?.let { uris.addAll(it) }
+        }
+        if (uris.isNotEmpty()) {
+            vm.tab = 0
+            vm.importUris(uris)
+        }
     }
 }
 __EOF__
@@ -796,7 +851,9 @@ cat > "app/src/main/java/com/bahith/pdf/Ui.kt" <<'__EOF__'
 package com.bahith.pdf
 
 import android.graphics.Bitmap
+import android.content.Intent
 import android.os.Build
+import android.speech.tts.TextToSpeech
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -853,6 +910,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import java.util.Locale
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
@@ -918,6 +976,9 @@ fun App(vm: AppViewModel = viewModel()) {
             val picker = rememberLauncherForActivityResult(
                 ActivityResultContracts.OpenMultipleDocuments()
             ) { uris -> vm.importUris(uris) }
+            val treePicker = rememberLauncherForActivityResult(
+                ActivityResultContracts.OpenDocumentTree()
+            ) { uri -> if (uri != null) vm.importTree(uri) }
             val target = vm.reader
             BackHandler(enabled = target != null) { vm.reader = null }
 
@@ -951,7 +1012,11 @@ fun App(vm: AppViewModel = viewModel()) {
                     ) { pad ->
                         Box(Modifier.padding(pad)) {
                             when (vm.tab) {
-                                0 -> LibraryScreen(vm) { picker.launch(arrayOf("application/pdf")) }
+                                0 -> LibraryScreen(
+                                    vm,
+                                    onAdd = { picker.launch(arrayOf("application/pdf")) },
+                                    onAddFolder = { treePicker.launch(null) }
+                                )
                                 1 -> SearchScreen(vm)
                                 else -> SettingsScreen(vm)
                             }
@@ -974,25 +1039,38 @@ fun App(vm: AppViewModel = viewModel()) {
 // ======================= المكتبة =======================
 
 @Composable
-fun LibraryScreen(vm: AppViewModel, onAdd: () -> Unit) {
+fun LibraryScreen(vm: AppViewModel, onAdd: () -> Unit, onAddFolder: () -> Unit) {
     val books by vm.books.collectAsStateWithLifecycle()
     var editing by remember { mutableStateOf<BookEntity?>(null) }
     var deleting by remember { mutableStateOf<BookEntity?>(null) }
-    val shown = remember(books, vm.libraryFilter, vm.sortOrder) {
-        arrangeBooks(books, vm.libraryFilter, vm.sortOrder)
+    var showAdd by remember { mutableStateOf(false) }
+    val shown = remember(books, vm.libraryFilter, vm.sortOrder, vm.libFavOnly) {
+        arrangeBooks(books, vm.libraryFilter, vm.sortOrder).filter { !vm.libFavOnly || it.favorite }
     }
 
     Scaffold(
         topBar = { CenterAlignedTopAppBar(title = { Text("باحث PDF") }) },
         floatingActionButton = {
             ExtendedFloatingActionButton(
-                onClick = onAdd,
+                onClick = { showAdd = true },
                 icon = { Icon(Icons.Default.Add, null) },
                 text = { Text("إضافة كتاب") }
             )
         }
     ) { pad ->
         Column(Modifier.padding(pad).fillMaxSize()) {
+            if (vm.importTotal > 0) {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
+                    LinearProgressIndicator(
+                        progress = { vm.importDone.toFloat() / vm.importTotal },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Text(
+                        "جارٍ إضافة الكتب… ${vm.importDone} / ${vm.importTotal}",
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                }
+            }
             if (books.isNotEmpty()) {
                 OutlinedTextField(
                     value = vm.libraryFilter,
@@ -1017,6 +1095,11 @@ fun LibraryScreen(vm: AppViewModel, onAdd: () -> Unit) {
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text("${books.size} كتاب", style = MaterialTheme.typography.labelLarge)
+                    FilterChip(
+                        selected = vm.libFavOnly,
+                        onClick = { vm.libFavOnly = !vm.libFavOnly },
+                        label = { Text("المفضلة فقط") }
+                    )
                     listOf("الأحدث", "الاسم", "المفضلة أولاً").forEachIndexed { i, s ->
                         FilterChip(
                             selected = vm.sortOrder == i,
@@ -1052,6 +1135,24 @@ fun LibraryScreen(vm: AppViewModel, onAdd: () -> Unit) {
         }
     }
 
+    if (showAdd) {
+        AlertDialog(
+            onDismissRequest = { showAdd = false },
+            title = { Text("إضافة كتب") },
+            text = {
+                Column {
+                    ScopeRow("اختيار ملفات PDF من الهاتف") { showAdd = false; onAdd() }
+                    ScopeRow("اختيار مجلد كامل (يضيف كل ما فيه من PDF)") { showAdd = false; onAddFolder() }
+                    Text(
+                        "يمكنك أيضاً فتح أي ملف PDF من تطبيق الملفات أو واتساب ثم اختيار «باحث PDF».",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            confirmButton = { TextButton(onClick = { showAdd = false }) { Text("إغلاق") } }
+        )
+    }
     editing?.let { b ->
         EditBookDialog(
             book = b,
@@ -1202,7 +1303,7 @@ fun SearchScreen(vm: AppViewModel) {
     var showScope by remember { mutableStateOf(false) }
 
     LaunchedEffect(vm.query, vm.mode, vm.scopeBookId, vm.resultLimit) {
-        delay(350)
+        delay(250)
         vm.search()
     }
 
@@ -1270,28 +1371,40 @@ fun SearchScreen(vm: AppViewModel) {
                     )
                 }
                 else -> {
-                    val shown = if (res.size >= vm.resultLimit) "${vm.resultLimit}+" else "${res.size}"
+                    val grouped = res.groupBy { it.bookId }
+                    var collapsed by remember(res) { mutableStateOf(setOf<Long>()) }
+                    val cap = if (res.size >= vm.resultLimit) "+" else ""
                     Text(
-                        "عدد الصفحات المطابقة: $shown",
+                        "${res.size}$cap نتيجة في ${grouped.size} كتاب",
                         Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
                         style = MaterialTheme.typography.labelMedium
                     )
-                    val grouped = res.groupBy { it.bookId }
                     LazyColumn(
                         Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(16.dp, 4.dp, 16.dp, 24.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        grouped.forEach { (_, hits) ->
+                        grouped.forEach { (bid, hits) ->
+                            val open = !collapsed.contains(bid)
                             item {
-                                Text(
-                                    "${hits.first().title}  (${hits.size})",
-                                    fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.padding(top = 8.dp)
-                                )
+                                Row(
+                                    Modifier.fillMaxWidth()
+                                        .clickable { collapsed = if (open) collapsed + bid else collapsed - bid }
+                                        .padding(top = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        hits.first().title + "  (" + hits.size + ")",
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    Text(if (open) "▾" else "◂", color = MaterialTheme.colorScheme.primary)
+                                }
                             }
-                            items(hits) { h -> HitCard(h) { vm.openHit(h) } }
+                            if (open) {
+                                items(hits) { h -> HitCard(h) { vm.openHit(h) } }
+                            }
                         }
                     }
                 }
@@ -1438,10 +1551,22 @@ fun SettingsScreen(vm: AppViewModel) {
                     onValueChangeFinished = { vm.saveFont() },
                     valueRange = 16f..34f
                 )
+                Text("تباعد الأسطر: ${"%.1f".format(vm.lineSpacing)}")
+                Slider(
+                    value = vm.lineSpacing,
+                    onValueChange = { vm.lineSpacing = it },
+                    onValueChangeFinished = { vm.saveReader() },
+                    valueRange = 1.2f..2.4f
+                )
+                Text("نوع الخط")
+                ChipRow(listOf("نسخ", "عادي"), vm.fontStyle) { vm.updateFontStyle(it) }
+                SwitchRow("إخفاء التشكيل في عرض النص", vm.hideTashkeel) { vm.updateHideTashkeel(it) }
+                SwitchRow("ضبط الفقرات (محاذاة الجانبين)", vm.justify) { vm.updateJustify(it) }
                 Text(
                     "بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ",
                     fontSize = vm.readerFont.sp,
-                    fontFamily = FontFamily.Serif
+                    fontFamily = if (vm.fontStyle == 0) FontFamily.Serif else FontFamily.SansSerif,
+                    textAlign = if (vm.justify) TextAlign.Justify else TextAlign.Start
                 )
             }
 
@@ -1497,6 +1622,14 @@ fun SettingsScreen(vm: AppViewModel) {
 
             SettingsCard("سجل التغييرات") {
                 Text("الإصدار $APP_VERSION", fontWeight = FontWeight.Bold)
+                Text("• إضافة كتب من مجلد كامل أو من «مشاركة/فتح بواسطة» أي ملف PDF")
+                Text("• تخطي الكتب المكررة تلقائياً مع شريط تقدّم للإضافة")
+                Text("• القارئ: بحث داخل الكتاب مع التنقل بين النتائج، وعلامات مرجعية")
+                Text("• القارئ: تكبير/تصغير الخط، ومشاركة النص، وقراءة صوتية للصفحة")
+                Text("• خيارات القراءة: تباعد الأسطر، ونوع الخط، وإخفاء التشكيل، وضبط الفقرات")
+                Text("• نتائج البحث قابلة للطي لكل كتاب، وبحث أسرع أثناء الكتابة")
+                Spacer(Modifier.height(6.dp))
+                Text("الإصدار 1.2", fontWeight = FontWeight.Bold)
                 Text("• اكتشاف النص التالف في ملفات PDF وقراءته بالـ OCR تلقائياً")
                 Text("• فهرسة أسرع: OCR متوازٍ مع اختيار السرعة والجودة")
                 Text("• الفهرسة تكمل في الخلفية وتظهر في الإشعارات")
@@ -1573,66 +1706,206 @@ fun ReaderScreen(vm: AppViewModel, target: ReaderTarget) {
     var textMode by remember { mutableStateOf(target.terms.isNotEmpty() && vm.hitView == 0) }
     var zoomed by remember { mutableStateOf(false) }
     var showGo by remember { mutableStateOf(false) }
+    var showMarks by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
+    var terms by remember { mutableStateOf(target.terms) }
+    var searchOpen by remember { mutableStateOf(false) }
+    var q by remember { mutableStateOf("") }
+    var hitPages by remember { mutableStateOf<List<Int>>(emptyList()) }
+    var hitIdx by remember { mutableIntStateOf(-1) }
+    var speaking by remember { mutableStateOf(false) }
+
+    val tts = remember { mutableStateOf<TextToSpeech?>(null) }
+    DisposableEffect(Unit) {
+        var ref: TextToSpeech? = null
+        ref = TextToSpeech(ctx) { st ->
+            if (st == TextToSpeech.SUCCESS) ref?.language = Locale("ar")
+        }
+        tts.value = ref
+        onDispose {
+            ref?.stop()
+            ref?.shutdown()
+        }
+    }
 
     LaunchedEffect(pagerState.currentPage) {
         zoomed = false
         vm.saveLastPage(book.id, pagerState.currentPage + 1)
+        if (speaking) {
+            tts.value?.stop()
+            speaking = false
+        }
     }
 
-    val widthPx = (LocalConfiguration.current.screenWidthDp *
-        LocalDensity.current.density * 1.5f).toInt().coerceIn(800, 2000)
+    LaunchedEffect(q) {
+        delay(300)
+        val t = Arabic.terms(q)
+        if (t.isEmpty() || t.sumOf { it.length } < 2) {
+            hitPages = emptyList()
+            hitIdx = -1
+            terms = target.terms
+        } else {
+            val r = vm.searchInBook(book.id, q)
+            hitPages = r.first
+            terms = r.second
+            textMode = true
+            if (r.first.isEmpty()) {
+                hitIdx = -1
+            } else {
+                val cur = pagerState.currentPage + 1
+                val i = r.first.indexOfFirst { it >= cur }
+                hitIdx = if (i < 0) 0 else i
+                pagerState.scrollToPage(r.first[hitIdx] - 1)
+            }
+        }
+    }
+
+    fun goHit(delta: Int) {
+        if (hitPages.isEmpty()) return
+        hitIdx = (hitIdx + delta + hitPages.size) % hitPages.size
+        scope.launch { pagerState.scrollToPage(hitPages[hitIdx] - 1) }
+    }
+
+    fun toast(m: String) {
+        Toast.makeText(ctx, m, Toast.LENGTH_SHORT).show()
+    }
+
+    val curPage = pagerState.currentPage + 1
+    val marked = vm.isBookmarked(book.id, curPage)
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text(
-                            book.title,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            style = MaterialTheme.typography.titleMedium
-                        )
-                        Text(
-                            "صفحة ${pagerState.currentPage + 1} من $total",
-                            style = MaterialTheme.typography.labelSmall
-                        )
-                    }
-                },
-                navigationIcon = {
-                    IconButton(onClick = { vm.reader = null }) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "رجوع")
-                    }
-                },
-                actions = {
-                    TextButton(onClick = { textMode = !textMode }) {
-                        Text(if (textMode) "عرض الصفحة" else "عرض النص")
-                    }
-                    Box {
-                        IconButton(onClick = { menu = true }) {
-                            Icon(Icons.Default.MoreVert, "المزيد")
-                        }
-                        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                            DropdownMenuItem(
-                                text = { Text("الانتقال إلى صفحة") },
-                                onClick = { menu = false; showGo = true }
+            Column {
+                TopAppBar(
+                    title = {
+                        Column {
+                            Text(
+                                book.title,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                style = MaterialTheme.typography.titleMedium
                             )
-                            DropdownMenuItem(
-                                text = { Text("نسخ نص الصفحة") },
-                                onClick = {
-                                    menu = false
-                                    scope.launch {
-                                        val t = vm.pageText(book.id, pagerState.currentPage + 1)
-                                        clipboard.setText(AnnotatedString(t))
-                                        Toast.makeText(ctx, "تم نسخ نص الصفحة", Toast.LENGTH_SHORT).show()
+                            Text(
+                                "صفحة $curPage من $total" + if (marked) "  ★" else "",
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                        }
+                    },
+                    navigationIcon = {
+                        IconButton(onClick = { vm.reader = null }) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, "رجوع")
+                        }
+                    },
+                    actions = {
+                        IconButton(onClick = { searchOpen = !searchOpen }) {
+                            Icon(Icons.Default.Search, "بحث في الكتاب")
+                        }
+                        TextButton(onClick = { textMode = !textMode }) {
+                            Text(if (textMode) "الصفحة" else "النص")
+                        }
+                        Box {
+                            IconButton(onClick = { menu = true }) {
+                                Icon(Icons.Default.MoreVert, "المزيد")
+                            }
+                            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                                DropdownMenuItem(
+                                    text = { Text("الانتقال إلى صفحة") },
+                                    onClick = { menu = false; showGo = true }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text(if (marked) "إزالة العلامة من هذه الصفحة" else "إضافة علامة لهذه الصفحة") },
+                                    onClick = { menu = false; vm.toggleBookmark(book.id, curPage) }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("العلامات المحفوظة") },
+                                    onClick = { menu = false; showMarks = true }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("تكبير الخط") },
+                                    onClick = {
+                                        vm.readerFont = (vm.readerFont + 2f).coerceAtMost(40f)
+                                        vm.saveFont()
                                     }
-                                }
-                            )
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("تصغير الخط") },
+                                    onClick = {
+                                        vm.readerFont = (vm.readerFont - 2f).coerceAtLeast(14f)
+                                        vm.saveFont()
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("نسخ نص الصفحة") },
+                                    onClick = {
+                                        menu = false
+                                        scope.launch {
+                                            val t = vm.pageText(book.id, curPage)
+                                            clipboard.setText(AnnotatedString(t))
+                                            toast("تم نسخ نص الصفحة")
+                                        }
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("مشاركة نص الصفحة") },
+                                    onClick = {
+                                        menu = false
+                                        scope.launch {
+                                            val t = vm.pageText(book.id, curPage)
+                                            val send = Intent(Intent.ACTION_SEND).apply {
+                                                type = "text/plain"
+                                                putExtra(Intent.EXTRA_TEXT, t)
+                                            }
+                                            ctx.startActivity(Intent.createChooser(send, "مشاركة نص الصفحة"))
+                                        }
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text(if (speaking) "إيقاف القراءة الصوتية" else "قراءة الصفحة صوتياً") },
+                                    onClick = {
+                                        menu = false
+                                        scope.launch {
+                                            if (speaking) {
+                                                tts.value?.stop()
+                                                speaking = false
+                                            } else {
+                                                val t = vm.pageText(book.id, curPage)
+                                                if (t.isBlank()) {
+                                                    toast("لا يوجد نص لهذه الصفحة")
+                                                } else {
+                                                    tts.value?.speak(t.take(3900), TextToSpeech.QUEUE_FLUSH, null, "page")
+                                                    speaking = true
+                                                }
+                                            }
+                                        }
+                                    }
+                                )
+                            }
                         }
+                    }
+                )
+                if (searchOpen) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedTextField(
+                            value = q,
+                            onValueChange = { q = it },
+                            modifier = Modifier.weight(1f),
+                            placeholder = { Text("ابحث في هذا الكتاب") },
+                            singleLine = true,
+                            shape = RoundedCornerShape(20.dp)
+                        )
+                        Text(
+                            if (hitPages.isEmpty()) (if (q.isBlank()) "" else "0") else "${hitIdx + 1}/${hitPages.size}",
+                            Modifier.padding(horizontal = 6.dp),
+                            style = MaterialTheme.typography.labelMedium
+                        )
+                        TextButton(onClick = { goHit(-1) }) { Text("السابق") }
+                        TextButton(onClick = { goHit(1) }) { Text("التالي") }
                     }
                 }
-            )
+            }
         }
     ) { pad ->
         HorizontalPager(
@@ -1641,13 +1914,37 @@ fun ReaderScreen(vm: AppViewModel, target: ReaderTarget) {
             modifier = Modifier.padding(pad).fillMaxSize()
         ) { idx ->
             if (textMode) {
-                TextPage(vm, book.id, idx + 1, target.terms)
+                TextPage(vm, book.id, idx + 1, terms)
             } else {
                 ZoomBox(onZoomChange = { zoomed = it }) {
-                    PdfPageImage(source, idx, widthPx)
+                    PdfPageImage(source, idx, (LocalConfiguration.current.screenWidthDp *
+                        LocalDensity.current.density * 1.5f).toInt().coerceIn(800, 2000))
                 }
             }
         }
+    }
+
+    if (showMarks) {
+        val marks = vm.bookmarksOf(book.id)
+        AlertDialog(
+            onDismissRequest = { showMarks = false },
+            title = { Text("العلامات المحفوظة") },
+            text = {
+                if (marks.isEmpty()) {
+                    Text("لا توجد علامات. أضف علامة من القائمة (⋮).")
+                } else {
+                    Column(Modifier.verticalScroll(rememberScrollState())) {
+                        marks.forEach { pg ->
+                            ScopeRow("صفحة $pg") {
+                                showMarks = false
+                                scope.launch { pagerState.scrollToPage((pg - 1).coerceIn(0, total - 1)) }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { showMarks = false }) { Text("إغلاق") } }
+        )
     }
 
     if (showGo) {
@@ -1705,16 +2002,18 @@ fun TextPage(vm: AppViewModel, bookId: Long, pageNo: Int, terms: List<String>) {
         when {
             t == null -> CircularProgressIndicator()
             t.isBlank() -> Text(
-                "لا يوجد نص لهذه الصفحة (لم تُفهرس بعد أو أنها فارغة). جرّب «عرض الصفحة».",
+                "لا يوجد نص لهذه الصفحة (لم تُفهرس بعد أو أنها فارغة). جرّب «الصفحة».",
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             else -> {
-                val ranges = remember(t, terms) { Arabic.findRanges(t, terms) }
+                val shown = if (vm.hideTashkeel) Arabic.stripTashkeel(t) else t
+                val ranges = remember(shown, terms) { Arabic.findRanges(shown, terms) }
                 Text(
-                    highlighted(t, ranges),
+                    highlighted(shown, ranges),
                     fontSize = vm.readerFont.sp,
-                    lineHeight = (vm.readerFont * 1.7f).sp,
-                    fontFamily = FontFamily.Serif,
+                    lineHeight = (vm.readerFont * vm.lineSpacing).sp,
+                    fontFamily = if (vm.fontStyle == 0) FontFamily.Serif else FontFamily.SansSerif,
+                    textAlign = if (vm.justify) TextAlign.Justify else TextAlign.Start,
                     color = MaterialTheme.colorScheme.onBackground
                 )
             }
@@ -1789,6 +2088,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.sqlite.db.SimpleSQLiteQuery
@@ -1813,7 +2113,7 @@ data class Hit(
 
 data class ReaderTarget(val bookId: Long, val page: Int, val terms: List<String>)
 
-const val APP_VERSION = "1.2"
+const val APP_VERSION = "1.3"
 
 fun arrangeBooks(list: List<BookEntity>, filter: String, sort: Int): List<BookEntity> {
     val f = Arabic.normalize(filter)
@@ -1854,6 +2154,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var workers by mutableIntStateOf(prefs.getInt("workers", 2))
     var ocrQuality by mutableIntStateOf(prefs.getInt("ocrq", 1))
     var hitView by mutableIntStateOf(prefs.getInt("hitview", 0))
+    var lineSpacing by mutableFloatStateOf(prefs.getFloat("lineSp", 1.7f))
+    var hideTashkeel by mutableStateOf(prefs.getBoolean("hideTash", false))
+    var justify by mutableStateOf(prefs.getBoolean("justify", false))
+    var fontStyle by mutableIntStateOf(prefs.getInt("fontStyle", 0))
+    var importTotal by mutableIntStateOf(0)
+    var importDone by mutableIntStateOf(0)
+    var libFavOnly by mutableStateOf(false)
+    var bookmarks by mutableStateOf(
+        (prefs.getString("bookmarks", "") ?: "").split("\n").filter { it.contains(":") }.toSet()
+    )
     var keepAwake by mutableStateOf(prefs.getBoolean("keepAwake", true))
     var sortOrder by mutableIntStateOf(prefs.getInt("sort", 0))
     var history by mutableStateOf(
@@ -1871,6 +2181,29 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun updateExtractMode(v: Int) { extractMode = v; prefs.edit().putInt("extract", v).apply() }
     fun updateWorkers(v: Int) { workers = v; prefs.edit().putInt("workers", v).apply() }
     fun updateOcrQuality(v: Int) { ocrQuality = v; prefs.edit().putInt("ocrq", v).apply() }
+    fun saveReader() { prefs.edit().putFloat("lineSp", lineSpacing).putFloat("font", readerFont).apply() }
+    fun updateHideTashkeel(v: Boolean) { hideTashkeel = v; prefs.edit().putBoolean("hideTash", v).apply() }
+    fun updateJustify(v: Boolean) { justify = v; prefs.edit().putBoolean("justify", v).apply() }
+    fun updateFontStyle(v: Int) { fontStyle = v; prefs.edit().putInt("fontStyle", v).apply() }
+
+    fun isBookmarked(bookId: Long, page: Int): Boolean = bookmarks.contains("$bookId:$page")
+
+    fun toggleBookmark(bookId: Long, page: Int) {
+        val k = "$bookId:$page"
+        bookmarks = if (bookmarks.contains(k)) bookmarks - k else bookmarks + k
+        prefs.edit().putString("bookmarks", bookmarks.joinToString("\n")).apply()
+    }
+
+    fun bookmarksOf(bookId: Long): List<Int> =
+        bookmarks.filter { it.startsWith("$bookId:") }
+            .mapNotNull { it.substringAfter(":").toIntOrNull() }.sorted()
+
+    private fun dropBookmarks(bookId: Long?) {
+        bookmarks = if (bookId == null) emptySet()
+        else bookmarks.filterNot { it.startsWith("$bookId:") }.toSet()
+        prefs.edit().putString("bookmarks", bookmarks.joinToString("\n")).apply()
+    }
+
     fun updateHitView(v: Int) { hitView = v; prefs.edit().putInt("hitview", v).apply() }
 
     private fun options(): IndexOptions {
@@ -1923,12 +2256,51 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------- إضافة الكتب ----------
     fun importUris(uris: List<Uri>) {
+        if (uris.isEmpty()) return
         viewModelScope.launch {
+            importTotal += uris.size
+            var added = 0
+            var dup = 0
             for (uri in uris) {
                 val id = withContext(Dispatchers.IO) { copyIn(uri) }
-                if (id != null) startIndex(id)
+                importDone += 1
+                if (id == null) {
+                    // فشل نسخ الملف وظهرت رسالة
+                } else if (id < 0) {
+                    dup++
+                } else {
+                    added++
+                    startIndex(id)
+                }
+            }
+            if (importDone >= importTotal) {
+                importTotal = 0
+                importDone = 0
+            }
+            if (uris.size > 1 || dup > 0) {
+                message = "تمت إضافة $added كتاب" + if (dup > 0) " وتخطي $dup مكرّر" else ""
             }
         }
+    }
+
+    fun importTree(tree: Uri) {
+        viewModelScope.launch {
+            val app = getApplication<Application>()
+            val uris = withContext(Dispatchers.IO) { collectPdfs(DocumentFile.fromTreeUri(app, tree)) }
+            if (uris.isEmpty()) message = "لم أجد ملفات PDF في هذا المجلد" else importUris(uris)
+        }
+    }
+
+    private fun collectPdfs(dir: DocumentFile?): List<Uri> {
+        val out = ArrayList<Uri>()
+        dir?.listFiles()?.forEach { f ->
+            if (f.isDirectory) {
+                out.addAll(collectPdfs(f))
+            } else if (f.type == "application/pdf" || f.name?.endsWith(".pdf", true) == true) {
+                out.add(f.uri)
+            }
+        }
+        return out
     }
 
     private suspend fun copyIn(uri: Uri): Long? {
@@ -1948,8 +2320,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 f.outputStream().use { o -> i.copyTo(o) }
             }
             val count = PdfSource(f).use { it.pageCount }
-            dao.setPageCount(id, count)
-            id
+            val dup = dao.allBooks().any { it.id != id && it.title == title && it.pageCount == count }
+            if (dup) {
+                f.delete()
+                dao.deleteBookFully(id)
+                -1L
+            } else {
+                dao.setPageCount(id, count)
+                id
+            }
         } catch (e: Exception) {
             f.delete()
             dao.deleteBookFully(id)
@@ -1995,6 +2374,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 dao.deleteBookFully(id)
                 File(booksDir(), "$id.pdf").delete()
             }
+            dropBookmarks(id)
             if (scopeBookId == id) scopeBookId = 0L
         }
     }
@@ -2008,6 +2388,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 dao.deleteAllBooks()
                 booksDir().listFiles()?.forEach { it.delete() }
             }
+            dropBookmarks(null)
             scopeBookId = 0L
             results = emptyList()
             searchedOnce = false
@@ -2075,6 +2456,27 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             Hit(it.bookId, it.title, it.pageNo, snip, ranges)
         }
         return hits to hl
+    }
+
+    /** أرقام الصفحات المطابقة داخل كتاب واحد (للبحث من القارئ). */
+    suspend fun searchInBook(bookId: Long, q: String): Pair<List<Int>, List<String>> {
+        val terms = Arabic.terms(q)
+        if (terms.isEmpty()) return Pair(emptyList(), emptyList())
+        val m = if (terms.size >= 6) SearchMode.PHRASE else SearchMode.ALL
+        val hl = if (m == SearchMode.PHRASE) listOf(terms.joinToString(" ")) else terms
+        val sql = "SELECT p.bookId AS bookId, p.pageNo AS pageNo, '' AS text, '' AS title " +
+            "FROM pages_fts JOIN pages p ON p.id = pages_fts.rowid " +
+            "WHERE pages_fts MATCH ? AND p.bookId = ? ORDER BY p.pageNo LIMIT 3000"
+        val rows = try {
+            withContext(Dispatchers.Default) {
+                dao.search(SimpleSQLiteQuery(sql, arrayOf<Any>(Arabic.ftsQuery(terms, m), bookId)))
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            emptyList()
+        }
+        return Pair(rows.map { it.pageNo }, hl)
     }
 
     fun openHit(h: Hit) {
