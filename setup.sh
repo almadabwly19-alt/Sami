@@ -17,8 +17,8 @@ android {
         applicationId = "com.bahith.pdf"
         minSdk = 26
         targetSdk = 34
-        versionCode = 5
-        versionName = "1.4"
+        versionCode = 8
+        versionName = "1.6"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
 
@@ -119,6 +119,7 @@ mkdir -p "$(dirname "app/src/main/AndroidManifest.xml")"
 cat > "app/src/main/AndroidManifest.xml" <<'__EOF__'
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -257,6 +258,17 @@ object Arabic {
     fun looksCorrupted(raw: String): Boolean {
         val norm = normalizeMapped(raw, true).text
         if (norm.contains("ملسو هيلع")) return true
+        if (raw.length > 120) {
+            val punct = ".,:;!?()[]{}\"'-_/*،؛؟«»…%"
+            var odd = 0
+            for (c in raw) {
+                if (c.isLetterOrDigit() || c.isWhitespace() || punct.indexOf(c) >= 0 ||
+                    Character.getType(c) == Character.NON_SPACING_MARK.toInt()
+                ) continue
+                odd++
+            }
+            if (odd.toDouble() / raw.length > 0.08) return true
+        }
         val toks = norm.split(' ').filter { t -> t.any { it in '\u0621'..'\u064A' } }
         if (toks.size < 25) return false
         val singles = toks.count { it.length == 1 }.toDouble() / toks.size
@@ -544,6 +556,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
@@ -592,6 +605,11 @@ class PdfSource(file: File) : Closeable {
         try { renderer.close() } catch (_: Exception) {}
         try { pfd.close() } catch (_: Exception) {}
     }
+
+    /** إغلاق آمن ينتظر انتهاء أي رسم جارٍ. */
+    suspend fun closeSafely() {
+        mutex.withLock { close() }
+    }
 }
 
 /**
@@ -604,7 +622,8 @@ data class IndexOptions(
     val workers: Int,
     val ocrWidth: Int,
     val bestModel: Boolean,
-    val ignoreMarks: Boolean
+    val ignoreMarks: Boolean,
+    val saveBoxes: Boolean
 )
 
 private const val MARKS = "\u064B\u064C\u064D\u064E\u064F\u0650\u0651\u0652\u0670"
@@ -655,13 +674,24 @@ class OcrPool(ctx: Context, size: Int, best: Boolean, ignoreMarks: Boolean) {
         available = ok
     }
 
-    suspend fun recognize(bmp: Bitmap): String {
+    /** يعيد النص ومواضع الكلمات (إن طُلبت). */
+    suspend fun recognize(bmp: Bitmap, wantBoxes: Boolean): Pair<String, List<WordBox>> {
         val api = channel.receive()
         return try {
             api.setImage(bmp)
-            api.getUTF8Text() ?: ""
+            val text = api.getUTF8Text() ?: ""
+            val boxes = if (wantBoxes && text.isNotBlank()) {
+                try {
+                    parseHocr(api.getHOCRText(0) ?: "", bmp.width, bmp.height)
+                } catch (e: Exception) {
+                    emptyList()
+                }
+            } else {
+                emptyList()
+            }
+            Pair(text, boxes)
         } catch (e: Exception) {
-            ""
+            Pair("", emptyList())
         } finally {
             channel.trySend(api)
         }
@@ -681,10 +711,16 @@ class Indexer(private val ctx: Context, private val dao: BookDao) {
         PDFBoxResourceLoader.init(ctx.applicationContext)
     }
 
-    private suspend fun ocrPage(s: PdfSource, index: Int, width: Int, pool: OcrPool): String {
-        val bmp = s.render(index, width) ?: return ""
+    private suspend fun ocrPage(
+        s: PdfSource,
+        index: Int,
+        width: Int,
+        pool: OcrPool,
+        wantBoxes: Boolean
+    ): Pair<String, List<WordBox>> {
+        val bmp = s.render(index, width) ?: return Pair("", emptyList())
         return try {
-            pool.recognize(bmp)
+            pool.recognize(bmp, wantBoxes)
         } finally {
             bmp.recycle()
         }
@@ -702,14 +738,21 @@ class Indexer(private val ctx: Context, private val dao: BookDao) {
         try { f.writeText(list.joinToString(",")) } catch (_: Exception) {}
     }
 
-    /** قراءة صفحة واحدة بأدق إعدادات (للإصلاح اليدوي). */
-    suspend fun ocrOne(bookId: Long, pageNo: Int, ignoreMarks: Boolean): String {
+    private suspend fun waitIfPaused() {
+        while (Work.paused) {
+            delay(400)
+            currentCoroutineContext().ensureActive()
+        }
+    }
+
+    /** قراءة صفحة واحدة بأدق إعدادات (للإصلاح اليدوي). تعيد النص ومواضع الكلمات. */
+    suspend fun ocrOne(bookId: Long, pageNo: Int, ignoreMarks: Boolean): Pair<String, List<WordBox>> {
         val file = File(ctx.filesDir, "books/$bookId.pdf")
-        if (!file.exists()) return ""
+        if (!file.exists()) return Pair("", emptyList())
         val s = PdfSource(file)
         val pool = OcrPool(ctx, 1, true, ignoreMarks)
         return try {
-            if (!pool.available) "" else ocrPage(s, pageNo - 1, 2400, pool)
+            if (!pool.available) Pair("", emptyList()) else ocrPage(s, pageNo - 1, 2400, pool, true)
         } finally {
             pool.close()
             s.close()
@@ -717,7 +760,7 @@ class Indexer(private val ctx: Context, private val dao: BookDao) {
     }
 
     /**
-     * المرحلة 1: فهرسة سريعة من نص الملف (يصبح البحث متاحاً خلال دقائق).
+     * المرحلة 1: فهرسة سريعة من نص الملف (يصبح البحث متاحاً خلال دقائق) مع حفظ مواضع الكلمات.
      * المرحلة 2: تحسين الصفحات التالفة بالـ OCR في الخلفية.
      */
     suspend fun index(bookId: Long, forceOcr: Boolean, restart: Boolean, opts: IndexOptions) {
@@ -725,9 +768,11 @@ class Indexer(private val ctx: Context, private val dao: BookDao) {
         if (book.status == ST_DONE && !forceOcr && !restart) return
         val file = File(ctx.filesDir, "books/$bookId.pdf")
         if (!file.exists()) {
+            Work.errors[bookId] = "ملف الكتاب غير موجود"
             dao.setStatus(bookId, ST_ERROR)
             return
         }
+        Work.errors.remove(bookId)
         val pendingFile = File(ctx.filesDir, "books/$bookId.pending")
         val reset = forceOcr || restart
         val resumePhase2 = !reset && book.status == ST_REFINING
@@ -737,6 +782,7 @@ class Indexer(private val ctx: Context, private val dao: BookDao) {
         var doc: PDDocument? = null
         var pool: OcrPool? = null
         var poolTried = false
+        var phase1Done = resumePhase2
 
         fun ensurePool(): OcrPool? {
             if (!poolTried) {
@@ -758,6 +804,7 @@ class Indexer(private val ctx: Context, private val dao: BookDao) {
                 if (reset) {
                     dao.deletePages(bookId)
                     pendingFile.delete()
+                    WordStore.deleteBook(ctx, bookId)
                 }
                 val done = if (reset) 0 else book.indexedPages
                 dao.setProgress(bookId, done, ST_INDEXING)
@@ -766,30 +813,38 @@ class Indexer(private val ctx: Context, private val dao: BookDao) {
                 } catch (e: Exception) {
                     null
                 }
-                val stripper = PDFTextStripper()
+                val stripper = GlyphStripper()
                 stripper.setSortByPosition(true)
                 val pending = readPending(pendingFile)
                 var p = done + 1
                 val chunk = 25
                 while (p <= total) {
                     currentCoroutineContext().ensureActive()
+                    waitIfPaused()
                     val end = minOf(total, p + chunk - 1)
                     val list = ArrayList<PageEntity>(end - p + 1)
                     for (i in p..end) {
                         var t = ""
+                        var words: List<WordBox> = emptyList()
                         val d = doc
                         if (d != null) {
-                            t = try {
+                            try {
+                                stripper.glyphs.clear()
                                 stripper.setStartPage(i)
                                 stripper.setEndPage(i)
-                                Normalizer.normalize(stripper.getText(d), Normalizer.Form.NFKC)
+                                t = Normalizer.normalize(stripper.getText(d), Normalizer.Form.NFKC)
+                                if (opts.saveBoxes) {
+                                    val box = d.getPage(i - 1).cropBox
+                                    words = buildWords(stripper.glyphs, box.width, box.height)
+                                }
                             } catch (e: Exception) {
-                                ""
+                                t = ""
+                                words = emptyList()
                             }
                         }
                         val flagged = allOcr ||
                             (!textOnly && (Arabic.letterCount(t) < 15 || Arabic.looksCorrupted(t)))
-                        if (flagged) pending.add(i)
+                        if (flagged) pending.add(i) else if (opts.saveBoxes) WordStore.save(ctx, bookId, i, words)
                         val tt = t.trim()
                         list.add(PageEntity(bookId = bookId, pageNo = i, text = tt, norm = Arabic.normalize(tt)))
                     }
@@ -800,6 +855,7 @@ class Indexer(private val ctx: Context, private val dao: BookDao) {
                 }
                 try { doc?.close() } catch (_: Exception) {}
                 doc = null
+                phase1Done = true
             }
 
             val queue = readPending(pendingFile).distinct().sorted().toMutableList()
@@ -811,24 +867,31 @@ class Indexer(private val ctx: Context, private val dao: BookDao) {
 
             dao.setProgress(bookId, total, ST_REFINING)
             Work.refineLeft[bookId] = queue.size
+            Work.refineStartLeft[bookId] = queue.size
+            Work.refineStartMs[bookId] = System.currentTimeMillis()
             val sem = Semaphore(workers)
             val batchSize = maxOf(4, workers * 2)
             while (queue.isNotEmpty()) {
                 currentCoroutineContext().ensureActive()
+                waitIfPaused()
                 val pl = ensurePool() ?: break
                 val batch = queue.take(batchSize)
                 val results = coroutineScope {
                     batch.map { page ->
                         async(Dispatchers.Default) {
-                            sem.withPermit { page to ocrPage(s, page - 1, opts.ocrWidth, pl) }
+                            sem.withPermit {
+                                page to ocrPage(s, page - 1, opts.ocrWidth, pl, opts.saveBoxes)
+                            }
                         }
                     }.awaitAll()
                 }
                 val ents = ArrayList<PageEntity>()
-                for ((page, r) in results) {
+                for ((page, res) in results) {
+                    val r = res.first
                     if (r.isNotBlank()) {
                         val t = r.trim()
                         ents.add(PageEntity(bookId = bookId, pageNo = page, text = t, norm = Arabic.normalize(t)))
+                        if (opts.saveBoxes) WordStore.save(ctx, bookId, page, res.second)
                     }
                 }
                 if (ents.isNotEmpty()) dao.updateMany(ents)
@@ -838,17 +901,224 @@ class Indexer(private val ctx: Context, private val dao: BookDao) {
             }
             pendingFile.delete()
             Work.refineLeft.remove(bookId)
+            Work.refineStartLeft.remove(bookId)
+            Work.refineStartMs.remove(bookId)
             dao.setProgress(bookId, total, ST_DONE)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
             Work.refineLeft.remove(bookId)
-            dao.setStatus(bookId, ST_ERROR)
+            Work.refineStartLeft.remove(bookId)
+            Work.refineStartMs.remove(bookId)
+            val msg = (e.message ?: e.javaClass.simpleName)
+            if (phase1Done) {
+                // النص مفهرس ويعمل البحث؛ تبقى صفحات التحسين المعلّقة للمحاولة لاحقاً
+                Work.errors[bookId] = "تعذّر إكمال تحسين النص: $msg"
+                dao.setProgress(bookId, book.pageCount.coerceAtLeast(1), ST_DONE)
+            } else {
+                Work.errors[bookId] = msg
+                dao.setStatus(bookId, ST_ERROR)
+            }
         } finally {
             try { doc?.close() } catch (_: Exception) {}
             src?.close()
             pool?.close()
         }
+    }
+}
+__EOF__
+mkdir -p "$(dirname "app/src/main/java/com/bahith/pdf/PublicLibrary.kt")"
+cat > "app/src/main/java/com/bahith/pdf/PublicLibrary.kt" <<'__EOF__'
+package com.bahith.pdf
+
+import android.net.Uri
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+
+/** نتيجة من فهرس الكتب المفتوحة في Internet Archive. */
+data class CatalogItem(
+    val identifier: String,
+    val title: String,
+    val creator: String,
+    val year: String,
+    val downloads: String
+)
+
+/**
+ * موصل أولي لفهرس Internet Archive العام. لا يفترض أن كل عنصر مجاني لإعادة النشر؛
+ * يجب على المستخدم مراجعة صفحة المصدر وبيانات الحقوق قبل الاستخدام أو إعادة التوزيع.
+ */
+object ArchiveCatalog {
+    private fun get(url: String): String {
+        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 15000
+            readTimeout = 30000
+            requestMethod = "GET"
+            setRequestProperty("User-Agent", "BahithPDF/1.6 (Android; public catalog search)")
+        }
+        try {
+            val code = connection.responseCode
+            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
+            val body = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+            if (code !in 200..299) throw IllegalStateException("HTTP $code")
+            return body
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    suspend fun search(query: String): List<CatalogItem> = withContext(Dispatchers.IO) {
+        val encoded = Uri.encode(query)
+        val url = "https://archive.org/advancedsearch.php?q=$encoded%20AND%20mediatype%3Atexts&fl%5B%5D=identifier&fl%5B%5D=title&fl%5B%5D=creator&fl%5B%5D=year&fl%5B%5D=downloads&rows=30&page=1&output=json"
+        val root = JSONObject(get(url))
+        val docs = root.optJSONObject("response")?.optJSONArray("docs") ?: return@withContext emptyList()
+        buildList {
+            for (i in 0 until docs.length()) {
+                val d = docs.optJSONObject(i) ?: continue
+                val id = d.optString("identifier").trim()
+                val title = d.optString("title").trim()
+                if (id.isBlank() || title.isBlank()) continue
+                add(CatalogItem(
+                    identifier = id,
+                    title = title,
+                    creator = d.optString("creator").takeUnless { it == "null" } ?: "",
+                    year = d.optString("year").takeUnless { it == "null" } ?: "",
+                    downloads = d.optString("downloads").takeUnless { it == "null" } ?: ""
+                ))
+            }
+        }
+    }
+
+    suspend fun downloadPdf(item: CatalogItem, onProgress: (Int) -> Unit): File = withContext(Dispatchers.IO) {
+        val metadata = JSONObject(get("https://archive.org/metadata/${Uri.encode(item.identifier)}"))
+        val files = metadata.optJSONArray("files") ?: throw IllegalStateException("لا توجد قائمة ملفات للمصدر")
+        var pdfName: String? = null
+        for (i in 0 until files.length()) {
+            val f = files.optJSONObject(i) ?: continue
+            val name = f.optString("name")
+            val format = f.optString("format")
+            if (name.endsWith(".pdf", true) || format.equals("pdf", true)) {
+                pdfName = name
+                break
+            }
+        }
+        val chosen = pdfName ?: throw IllegalStateException("هذا السجل لا يوفر ملف PDF قابلاً للتنزيل")
+        val encodedName = chosen.split("/").joinToString("/") { Uri.encode(it) }
+        val downloadUrl = "https://archive.org/download/${Uri.encode(item.identifier)}/$encodedName"
+        val connection = (URL(downloadUrl).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 20000
+            readTimeout = 60000
+            setRequestProperty("User-Agent", "BahithPDF/1.6 (Android)")
+        }
+        val out = File.createTempFile("bahith_catalog_", ".part")
+        try {
+            val code = connection.responseCode
+            if (code !in 200..299) throw IllegalStateException("تعذّر جلب ملف PDF: HTTP $code")
+            val total = connection.contentLengthLong
+            connection.inputStream.use { input ->
+                out.outputStream().buffered().use { output ->
+                    val buffer = ByteArray(64 * 1024)
+                    var count: Int
+                    var received = 0L
+                    while (input.read(buffer).also { count = it } >= 0) {
+                        if (count == 0) continue
+                        output.write(buffer, 0, count)
+                        received += count
+                        if (total > 0) onProgress(((received * 100) / total).toInt().coerceIn(0, 99))
+                    }
+                }
+            }
+            if (out.length() < 1000L) throw IllegalStateException("الملف المستلم صغير أو غير صالح")
+            onProgress(100)
+            out
+        } catch (e: Exception) {
+            out.delete()
+            throw e
+        } finally {
+            connection.disconnect()
+        }
+    }
+}
+
+@Composable
+fun PublicLibraryScreen(vm: AppViewModel) {
+    Column(Modifier.fillMaxSize().padding(16.dp)) {
+        Text("المكتبة العامة", style = MaterialTheme.typography.headlineSmall)
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "هذا البحث يستعلم عن بيانات الكتب العامة (العنوان والمؤلف والبيانات الوصفية)، وليس نص صفحات جميع الكتب. بعد تنزيل كتاب PDF وفهرسته يصبح البحث في نصه متاحاً محلياً، مع تحديد مواضع الكلمات على صفحاته عند توفر إحداثيات النص أو OCR.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.height(12.dp))
+        OutlinedTextField(
+            value = vm.catalogQuery,
+            onValueChange = { vm.catalogQuery = it },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("عنوان الكتاب أو المؤلف أو الموضوع") },
+            singleLine = true
+        )
+        Button(
+            onClick = { vm.searchCatalog() },
+            enabled = !vm.catalogLoading && vm.catalogQuery.trim().length >= 2,
+            modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+        ) { Text("البحث في المكتبة العامة") }
+        if (vm.catalogLoading) {
+            LinearProgressIndicator(Modifier.fillMaxWidth().padding(top = 8.dp))
+        }
+        if (vm.downloadingId != null) {
+            Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                Text("جارٍ تنزيل الكتاب… ${vm.downloadProgress}%")
+                LinearProgressIndicator(
+                    progress = { vm.downloadProgress / 100f },
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        }
+        vm.catalogError?.let {
+            Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(vertical = 8.dp))
+        }
+        LazyColumn(
+            modifier = Modifier.weight(1f),
+            contentPadding = PaddingValues(vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            items(vm.catalogResults, key = { it.identifier }) { item ->
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text(item.title, style = MaterialTheme.typography.titleMedium)
+                        if (item.creator.isNotBlank()) Text("المؤلف: ${item.creator}", style = MaterialTheme.typography.bodySmall)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (item.year.isNotBlank()) Text("السنة: ${item.year}  ", style = MaterialTheme.typography.labelSmall)
+                            if (item.downloads.isNotBlank()) Text("التنزيلات: ${item.downloads}", style = MaterialTheme.typography.labelSmall)
+                        }
+                        Text("المصدر: Internet Archive • راجع حقوق الكتاب قبل إعادة نشره.", style = MaterialTheme.typography.labelSmall)
+                        TextButton(
+                            onClick = { vm.downloadCatalogBook(item) },
+                            enabled = vm.downloadingId == null
+                        ) { Text("تنزيل PDF وإضافته إلى مكتبتي") }
+                    }
+                }
+            }
+        }
+        Text(
+            "تنبيه: توفر الكتاب في الفهرس لا يعني بالضرورة أن حقوق إعادة نشره متاحة. بعد التنزيل يمكنك البحث فيه دون إنترنت، أما تصفح الفهرس والتنزيل فيحتاجان إلى اتصال.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }
 __EOF__
@@ -872,7 +1142,10 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import java.util.concurrent.ConcurrentHashMap
 
 /** مكان واحد لأعمال الفهرسة، يبقى حياً حتى لو أُغلقت الشاشة. */
@@ -883,6 +1156,14 @@ object Work {
 
     /** عدد الصفحات المتبقية لتحسين نصها بالـ OCR، لكل كتاب. */
     val refineLeft = mutableStateMapOf<Long, Int>()
+    val refineStartLeft = mutableStateMapOf<Long, Int>()
+    val refineStartMs = mutableStateMapOf<Long, Long>()
+
+    /** رسالة آخر خطأ في فهرسة كل كتاب. */
+    val errors = mutableStateMapOf<Long, String>()
+
+    /** إيقاف مؤقت لكل أعمال الفهرسة. */
+    var paused by mutableStateOf(false)
 
     @Volatile
     private var idx: Indexer? = null
@@ -957,6 +1238,7 @@ cat > "app/src/main/java/com/bahith/pdf/Ui.kt" <<'__EOF__'
 package com.bahith.pdf
 
 import android.graphics.Bitmap
+import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.speech.tts.TextToSpeech
@@ -983,12 +1265,14 @@ import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
@@ -1017,8 +1301,10 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import java.util.Locale
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
 val MARK_COLORS = listOf(Color(0xFFFFD54F), Color(0xFFA5D6A7), Color(0xFFF48FB1), Color(0xFF90CAF9))
@@ -1115,6 +1401,12 @@ fun App(vm: AppViewModel = viewModel()) {
                                     label = { Text("البحث") }
                                 )
                                 NavigationBarItem(
+                                    selected = vm.tab == 3,
+                                    onClick = { vm.tab = 3 },
+                                    icon = { Icon(Icons.Default.Share, null) },
+                                    label = { Text("العامة") }
+                                )
+                                NavigationBarItem(
                                     selected = vm.tab == 2,
                                     onClick = { vm.tab = 2 },
                                     icon = { Icon(Icons.Default.Settings, null) },
@@ -1131,6 +1423,7 @@ fun App(vm: AppViewModel = viewModel()) {
                                     onAddFolder = { treePicker.launch(null) }
                                 )
                                 1 -> SearchScreen(vm)
+                                3 -> PublicLibraryScreen(vm)
                                 else -> SettingsScreen(vm)
                             }
                         }
@@ -1186,6 +1479,24 @@ fun LibraryScreen(vm: AppViewModel, onAdd: () -> Unit, onAddFolder: () -> Unit) 
                         "جارٍ إضافة الكتب… ${vm.importDone} / ${vm.importTotal}",
                         style = MaterialTheme.typography.labelMedium
                     )
+                }
+            }
+            val busyNow = books.any {
+                it.status == ST_QUEUED || it.status == ST_INDEXING || it.status == ST_REFINING
+            }
+            if (busyNow) {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        if (Work.paused) "الفهرسة متوقفة مؤقتاً" else "الفهرسة جارية…",
+                        Modifier.weight(1f),
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                    TextButton(onClick = { vm.togglePause() }) {
+                        Text(if (Work.paused) "استئناف" else "إيقاف مؤقت")
+                    }
                 }
             }
             if (books.isNotEmpty()) {
@@ -1304,6 +1615,15 @@ fun BookCard(b: BookEntity, vm: AppViewModel, onEdit: () -> Unit, onDelete: () -
                     )
                 }
                 Spacer(Modifier.height(4.dp))
+                val er = Work.errors[b.id]
+                if (er != null && b.status != ST_QUEUED && b.status != ST_INDEXING) {
+                    Text(
+                        er,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        maxLines = 3
+                    )
+                }
                 when (b.status) {
                     ST_DONE -> {
                         val resume = if (b.lastPage > 1) " • آخر قراءة: صفحة ${b.lastPage}" else ""
@@ -1314,10 +1634,16 @@ fun BookCard(b: BookEntity, vm: AppViewModel, onEdit: () -> Unit, onDelete: () -
                     }
                     ST_REFINING -> {
                         val left = Work.refineLeft[b.id]
+                        val sl = Work.refineStartLeft[b.id]
+                        val st = Work.refineStartMs[b.id]
+                        val eta = if (left != null && sl != null && st != null && sl - left > 0) {
+                            val per = (System.currentTimeMillis() - st).toDouble() / (sl - left)
+                            " • نحو ${(per * left / 60000.0).toInt() + 1} د"
+                        } else ""
                         val frac = if (left != null && b.pageCount > 0) 1f - left.toFloat() / b.pageCount else 0f
                         Text(
                             "${b.pageCount} صفحة • جاهز للبحث • يُحسَّن النص بالـ OCR" +
-                                (if (left != null) " (متبقي $left)" else ""),
+                                (if (left != null) " (متبقي $left$eta)" else ""),
                             style = MaterialTheme.typography.labelMedium
                         )
                         Spacer(Modifier.height(4.dp))
@@ -1518,7 +1844,13 @@ fun SearchScreen(vm: AppViewModel) {
                                 }
                             }
                             if (open) {
-                                items(hits) { h -> HitCard(h, markColor(vm.highlightIdx)) { vm.openHit(h) } }
+                                items(hits) { h ->
+                                    if (vm.resultStyle == 0) {
+                                        HitCardImage(vm, h) { vm.openHit(h) }
+                                    } else {
+                                        HitCard(h, markColor(vm.highlightIdx)) { vm.openHit(h) }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1599,6 +1931,77 @@ fun HitCard(h: Hit, color: Color, onClick: () -> Unit) {
                 style = MaterialTheme.typography.bodyMedium,
                 lineHeight = 24.sp
             )
+        }
+    }
+}
+
+class Crop(val bmp: Bitmap, val rects: List<WordBox>)
+
+/** مقطع من صفحة الكتاب نفسه حول أول موضع للنتيجة، مع مستطيلات التظليل. */
+suspend fun makeCrop(ctx: Context, h: Hit, terms: List<String>, band: Int): Crop? {
+    val boxes = WordStore.load(ctx, h.bookId, h.pageNo)
+    if (boxes.isEmpty()) return null
+    val hits = matchBoxes(boxes, terms)
+    if (hits.isEmpty()) return null
+    val bmp = PageCache.page(ctx, h.bookId, h.pageNo - 1, 1100) ?: return null
+    val first = hits[0]
+    val i = band.coerceIn(0, 2)
+    val before = floatArrayOf(0.035f, 0.06f, 0.10f)[i]
+    val after = floatArrayOf(0.05f, 0.09f, 0.15f)[i]
+    val top = (first.y - before).coerceAtLeast(0f)
+    val bottom = (first.y + first.hh + after).coerceAtMost(1f)
+    val span = (bottom - top).coerceAtLeast(0.05f)
+    val t = (top * bmp.height).toInt().coerceIn(0, bmp.height - 2)
+    val hpx = (span * bmp.height).toInt().coerceIn(2, bmp.height - t)
+    val crop = Bitmap.createBitmap(bmp, 0, t, bmp.width, hpx)
+    val real = hpx.toFloat() / bmp.height
+    val rects = hits.filter { it.y + it.hh >= top && it.y <= top + real }
+        .map { WordBox(it.w, it.x, (it.y - top) / real, it.ww, it.hh / real) }
+    return Crop(crop, rects)
+}
+
+@Composable
+fun HitCardImage(vm: AppViewModel, h: Hit, onClick: () -> Unit) {
+    val ctx = LocalContext.current
+    val terms = vm.hlTerms
+    val crop by produceState<Crop?>(null, h.bookId, h.pageNo, terms, vm.cropBand) {
+        value = withContext(Dispatchers.IO) { makeCrop(ctx, h, terms, vm.cropBand) }
+    }
+    val color = markColor(vm.highlightIdx)
+    val c = crop
+    if (c == null) {
+        HitCard(h, color, onClick)
+        return
+    }
+    Card(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+    ) {
+        Column(Modifier.padding(10.dp)) {
+            Text(
+                "صفحة ${h.pageNo}",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary
+            )
+            Spacer(Modifier.height(4.dp))
+            Box(Modifier.fillMaxWidth().aspectRatio(c.bmp.width.toFloat() / c.bmp.height)) {
+                Image(
+                    bitmap = c.bmp.asImageBitmap(),
+                    contentDescription = null,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.FillBounds
+                )
+                Canvas(Modifier.fillMaxSize()) {
+                    for (r in c.rects) {
+                        drawRect(
+                            color = color.copy(alpha = vm.hlAlpha),
+                            topLeft = Offset(r.x * size.width, r.y * size.height),
+                            size = Size(r.ww * size.width, r.hh * size.height)
+                        )
+                    }
+                }
+            }
         }
     }
 }
@@ -1691,6 +2094,14 @@ fun SettingsScreen(vm: AppViewModel) {
                 Text("عند فتح نتيجة بحث")
                 ChipRow(listOf("نص الصفحة", "صورة الصفحة"), vm.hitView) { vm.updateHitView(it) }
                 SwitchRow("إبقاء الشاشة مفعّلة أثناء القراءة", vm.keepAwakeRead) { vm.updateKeepAwakeRead(it) }
+                SwitchRow("تظليل نتيجة البحث فوق صورة الصفحة", vm.hlOnPage) { vm.updateHlOnPage(it) }
+                Text("شفافية التظليل: ${(vm.hlAlpha * 100).toInt()}%")
+                Slider(
+                    value = vm.hlAlpha,
+                    onValueChange = { vm.hlAlpha = it },
+                    onValueChangeFinished = { vm.saveHlAlpha() },
+                    valueRange = 0.15f..0.8f
+                )
             }
 
             SettingsCard("البحث") {
@@ -1704,7 +2115,11 @@ fun SettingsScreen(vm: AppViewModel) {
                     limits.map { "$it" },
                     limits.indexOf(vm.resultLimit).coerceAtLeast(0)
                 ) { vm.updateLimit(limits[it]) }
-                Text("طول مقتطف النتيجة")
+                Text("شكل نتائج البحث")
+                ChipRow(listOf("صورة من الصفحة مع التظليل", "نص فقط"), vm.resultStyle) { vm.updateResultStyle(it) }
+                Text("حجم مقطع الصفحة في النتيجة")
+                ChipRow(listOf("ضيق", "متوسط", "واسع"), vm.cropBand) { vm.updateCropBand(it) }
+                Text("طول مقتطف النتيجة (عند عرض النص)")
                 ChipRow(listOf("قصير", "متوسط", "طويل"), vm.snippetLen) { vm.updateSnippetLen(it) }
                 SwitchRow("البحث أثناء الكتابة", vm.liveSearch) { vm.updateLiveSearch(it) }
                 SwitchRow("حفظ سجل البحث", vm.saveHistory) { vm.updateSaveHistory(it) }
@@ -1740,11 +2155,17 @@ fun SettingsScreen(vm: AppViewModel) {
                 )
                 Text("سرعة الفهرسة (عدد المعالجات)")
                 ChipRow(listOf("1", "2", "3", "4", "5", "6"), vm.workers - 1) { vm.updateWorkers(it + 1) }
-                Text("جودة الـ OCR")
-                ChipRow(
-                    listOf("سريعة", "متوازنة", "عالية (نموذج أدق)"),
-                    vm.ocrQuality
-                ) { vm.updateOcrQuality(it) }
+                Text("نموذج الـ OCR")
+                ChipRow(listOf("سريع", "أدق (أبطأ)"), vm.ocrModel) { vm.updateOcrModel(it) }
+                Text("دقة صورة الـ OCR: ${vm.ocrWidth} بكسل")
+                Slider(
+                    value = vm.ocrWidth.toFloat(),
+                    onValueChange = { vm.ocrWidth = (it / 100f).toInt() * 100 },
+                    onValueChangeFinished = { vm.saveOcrWidth() },
+                    valueRange = 1200f..3000f
+                )
+                SwitchRow("حفظ مواضع الكلمات (لتظليل الصفحة)", vm.saveBoxes) { vm.updateSaveBoxes(it) }
+                SwitchRow("إيقاف الفهرسة مؤقتاً", Work.paused) { Work.paused = it }
                 SwitchRow("تجاهل التشكيل أثناء قراءة OCR (أدق للحروف)", vm.ocrIgnoreMarks) {
                     vm.updateOcrIgnoreMarks(it)
                 }
@@ -1770,6 +2191,14 @@ fun SettingsScreen(vm: AppViewModel) {
 
             SettingsCard("سجل التغييرات") {
                 Text("الإصدار $APP_VERSION", fontWeight = FontWeight.Bold)
+                Text("• نتيجة البحث تعرض مقطعاً من صفحة الكتاب نفسه مع تظليل الكلمة")
+                Text("• فتح النتيجة على صفحة الكتاب مع التظليل فوق الصورة")
+                Text("• فهرسة أسرع: تمريرة واحدة لاستخراج النص ومواضع الكلمات، وإيقاف مؤقت")
+                Text("• مدة تقديرية للتحسين، ورسالة خطأ واضحة لكل كتاب تعذّر فهرسته")
+                Text("• إعدادات جديدة: دقة OCR، ونموذج OCR، وحفظ المواضع، وشفافية التظليل")
+                Text("• تبويب «العامة»: بحث وتنزيل من فهرس Internet Archive")
+                Spacer(Modifier.height(6.dp))
+                Text("الإصدار 1.4", fontWeight = FontWeight.Bold)
                 Text("• فهرسة بمرحلتين: بحث متاح بسرعة، وتحسين الـ OCR في الخلفية")
                 Text("• نموذج OCR أدق وجودة أعلى، وخيار تجاهل التشكيل لدقة الحروف")
                 Text("• تعديل نص أي صفحة يدوياً، وإعادة قراءة صفحة واحدة بالـ OCR الدقيق")
@@ -1793,7 +2222,7 @@ fun SettingsScreen(vm: AppViewModel) {
             SettingsCard("حول التطبيق") {
                 Text("باحث PDF — الإصدار $APP_VERSION")
                 Text(
-                    "يعمل بالكامل دون إنترنت. الكتب والفهرس محفوظان داخل التطبيق على هاتفك.",
+                    "القراءة والبحث والفهرسة تعمل دون إنترنت. الإنترنت مطلوب فقط لتبويب «العامة» (تصفّح الفهرس وتنزيل الكتب).",
                     style = MaterialTheme.typography.bodySmall
                 )
             }
@@ -2075,9 +2504,30 @@ fun ReaderScreen(vm: AppViewModel, target: ReaderTarget) {
             if (textMode) {
                 TextPage(vm, book.id, idx + 1, terms)
             } else {
-                ZoomBox(onZoomChange = { zoomed = it }) {
-                    PdfPageImage(source, idx, (LocalConfiguration.current.screenWidthDp *
-                        LocalDensity.current.density * 1.5f).toInt().coerceIn(800, 2000))
+                val ctxP = LocalContext.current
+                val boxes by produceState<List<WordBox>>(emptyList(), book.id, idx, vm.textVersion) {
+                    value = withContext(Dispatchers.IO) { WordStore.load(ctxP, book.id, idx + 1) }
+                }
+                val rects = remember(boxes, terms, vm.hlOnPage) {
+                    if (vm.hlOnPage) matchBoxes(boxes, terms) else emptyList()
+                }
+                Box(Modifier.fillMaxSize()) {
+                    ZoomBox(onZoomChange = { zoomed = it }) {
+                        PdfPageImage(
+                            source, idx,
+                            (LocalConfiguration.current.screenWidthDp *
+                                LocalDensity.current.density * 1.5f).toInt().coerceIn(800, 2000),
+                            rects, markColor(vm.highlightIdx), vm.hlAlpha
+                        )
+                    }
+                    if (terms.isNotEmpty() && boxes.isEmpty()) {
+                        Text(
+                            "لا توجد مواضع محفوظة لهذه الصفحة — أعد فهرسة الكتاب لتظليلها",
+                            Modifier.align(Alignment.BottomCenter).padding(8.dp),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
             }
         }
@@ -2156,19 +2606,41 @@ fun ReaderScreen(vm: AppViewModel, target: ReaderTarget) {
 }
 
 @Composable
-fun PdfPageImage(source: PdfSource, index: Int, widthPx: Int) {
+fun PdfPageImage(
+    source: PdfSource,
+    index: Int,
+    widthPx: Int,
+    rects: List<WordBox>,
+    color: Color,
+    alpha: Float
+) {
     var bmp by remember(index) { mutableStateOf<Bitmap?>(null) }
     LaunchedEffect(index) { bmp = source.render(index, widthPx) }
     val b = bmp
     if (b == null) {
         Box(Modifier.fillMaxSize(), Alignment.Center) { CircularProgressIndicator() }
     } else {
-        Image(
-            bitmap = b.asImageBitmap(),
-            contentDescription = null,
-            modifier = Modifier.fillMaxSize(),
-            contentScale = ContentScale.Fit
-        )
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Box(Modifier.aspectRatio(b.width.toFloat() / b.height)) {
+                Image(
+                    bitmap = b.asImageBitmap(),
+                    contentDescription = null,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.FillBounds
+                )
+                if (rects.isNotEmpty()) {
+                    Canvas(Modifier.fillMaxSize()) {
+                        for (r in rects) {
+                            drawRect(
+                                color = color.copy(alpha = alpha),
+                                topLeft = Offset(r.x * size.width, r.y * size.height),
+                                size = Size(r.ww * size.width, r.hh * size.height)
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2293,7 +2765,7 @@ data class Hit(
 
 data class ReaderTarget(val bookId: Long, val page: Int, val terms: List<String>)
 
-const val APP_VERSION = "1.4"
+const val APP_VERSION = "1.6"
 
 fun arrangeBooks(list: List<BookEntity>, filter: String, sort: Int): List<BookEntity> {
     val f = Arabic.normalize(filter)
@@ -2335,7 +2807,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         prefs.getInt("workers", minOf(4, maxOf(2, Runtime.getRuntime().availableProcessors() / 2)))
     )
     var ocrQuality by mutableIntStateOf(prefs.getInt("ocrq", 1))
-    var hitView by mutableIntStateOf(prefs.getInt("hitview", 0))
+    var hitView by mutableIntStateOf(prefs.getInt("hitview", 1))
     var lineSpacing by mutableFloatStateOf(prefs.getFloat("lineSp", 1.7f))
     var hideTashkeel by mutableStateOf(prefs.getBoolean("hideTash", false))
     var justify by mutableStateOf(prefs.getBoolean("justify", false))
@@ -2352,7 +2824,24 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var saveHistory by mutableStateOf(prefs.getBoolean("saveHist", true))
     var highlightIdx by mutableIntStateOf(prefs.getInt("hl", 0))
     var keepAwakeRead by mutableStateOf(prefs.getBoolean("awakeRead", false))
+    var ocrModel by mutableIntStateOf(prefs.getInt("ocrModel", 0))
+    var ocrWidth by mutableIntStateOf(prefs.getInt("ocrWidth", 1900))
+    var saveBoxes by mutableStateOf(prefs.getBoolean("saveBoxes", true))
+    var resultStyle by mutableIntStateOf(prefs.getInt("resStyle", 0))
+    var cropBand by mutableIntStateOf(prefs.getInt("cropBand", 1))
+    var hlAlpha by mutableFloatStateOf(prefs.getFloat("hlAlpha", 0.45f))
+    var hlOnPage by mutableStateOf(prefs.getBoolean("hlOnPage", true))
+    var hlTerms by mutableStateOf<List<String>>(emptyList())
     var textVersion by mutableIntStateOf(0)
+
+    // ---------- المكتبة العامة: فهرس Internet Archive المفتوح ----------
+    var catalogQuery by mutableStateOf("")
+    var catalogResults by mutableStateOf<List<CatalogItem>>(emptyList())
+    var catalogLoading by mutableStateOf(false)
+    var catalogError by mutableStateOf<String?>(null)
+    var downloadingId by mutableStateOf<String?>(null)
+    var downloadProgress by mutableIntStateOf(0)
+    private var catalogJob: Job? = null
     var renorming by mutableStateOf(false)
     var bookmarks by mutableStateOf(
         (prefs.getString("bookmarks", "") ?: "").split("\n").filter { it.contains(":") }.toSet()
@@ -2399,14 +2888,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun updateHitView(v: Int) { hitView = v; prefs.edit().putInt("hitview", v).apply() }
 
-    private fun options(): IndexOptions {
-        val width = when (ocrQuality) {
-            0 -> 1400
-            2 -> 2400
-            else -> 1900
-        }
-        return IndexOptions(extractMode, workers, width, ocrQuality == 2, ocrIgnoreMarks)
-    }
+    private fun options(): IndexOptions =
+        IndexOptions(extractMode, workers, ocrWidth, ocrModel == 1, ocrIgnoreMarks, saveBoxes)
+
+    fun updateOcrModel(v: Int) { ocrModel = v; prefs.edit().putInt("ocrModel", v).apply() }
+    fun saveOcrWidth() { prefs.edit().putInt("ocrWidth", ocrWidth).apply() }
+    fun updateSaveBoxes(v: Boolean) { saveBoxes = v; prefs.edit().putBoolean("saveBoxes", v).apply() }
+    fun updateResultStyle(v: Int) { resultStyle = v; prefs.edit().putInt("resStyle", v).apply() }
+    fun updateCropBand(v: Int) { cropBand = v; prefs.edit().putInt("cropBand", v).apply() }
+    fun saveHlAlpha() { prefs.edit().putFloat("hlAlpha", hlAlpha).apply() }
+    fun updateHlOnPage(v: Boolean) { hlOnPage = v; prefs.edit().putBoolean("hlOnPage", v).apply() }
+    fun togglePause() { Work.paused = !Work.paused }
 
     fun updateOcrIgnoreMarks(v: Boolean) { ocrIgnoreMarks = v; prefs.edit().putBoolean("ocrNoMarks", v).apply() }
     fun updateSnippetLen(v: Int) { snippetLen = v; prefs.edit().putInt("snippet", v).apply() }
@@ -2460,13 +2952,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun reOcrPage(bookId: Long, pageNo: Int, done: (Boolean) -> Unit) {
         viewModelScope.launch {
             val app = getApplication<Application>()
-            val t = withContext(Dispatchers.Default) {
+            val r = withContext(Dispatchers.Default) {
                 Work.indexer(app).ocrOne(bookId, pageNo, ocrIgnoreMarks)
             }
+            val t = r.first
             if (t.isBlank()) {
                 done(false)
             } else {
                 dao.updatePage(bookId, pageNo, t.trim(), Arabic.normalize(t))
+                if (saveBoxes) WordStore.save(app, bookId, pageNo, r.second)
                 textVersion++
                 done(true)
             }
@@ -2631,6 +3125,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun delete(id: Long) {
         viewModelScope.launch {
             Work.jobs.remove(id)?.cancelAndJoin()
+            PageCache.drop(id)
+            WordStore.deleteBook(getApplication<Application>(), id)
             withContext(Dispatchers.IO) {
                 dao.deleteBookFully(id)
                 File(booksDir(), "$id.pdf").delete()
@@ -2644,6 +3140,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             Work.jobs.values.toList().forEach { it.cancelAndJoin() }
             Work.jobs.clear()
+            PageCache.dropAll()
+            WordStore.deleteAll(getApplication<Application>())
             withContext(Dispatchers.IO) {
                 dao.deleteAllPages()
                 dao.deleteAllBooks()
@@ -2660,6 +3158,66 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val files = booksDir().listFiles()?.sumOf { it.length() } ?: 0L
         val db = getApplication<Application>().getDatabasePath("bahith.db").length()
         files + db
+    }
+
+    // ---------- البحث والتنزيل من المكتبة العامة ----------
+    fun searchCatalog() {
+        val q = catalogQuery.trim()
+        if (q.length < 2) {
+            catalogError = "اكتب كلمتين على الأقل للبحث في فهرس الكتب."
+            catalogResults = emptyList()
+            return
+        }
+        catalogJob?.cancel()
+        catalogJob = viewModelScope.launch {
+            catalogLoading = true
+            catalogError = null
+            try {
+                catalogResults = withContext(Dispatchers.IO) { ArchiveCatalog.search(q) }
+                if (catalogResults.isEmpty()) catalogError = "لم يُعثر على كتب PDF مطابقة. جرّب عبارة أخرى."
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                catalogError = "تعذّر الاتصال بفهرس المكتبة العامة: ${e.message ?: "خطأ اتصال"}"
+            } finally {
+                catalogLoading = false
+            }
+        }
+    }
+
+    fun downloadCatalogBook(item: CatalogItem) {
+        if (downloadingId != null) {
+            message = "يوجد تنزيل جارٍ. انتظر حتى ينتهي قبل بدء تنزيل آخر."
+            return
+        }
+        viewModelScope.launch {
+            downloadingId = item.identifier
+            downloadProgress = 0
+            var temp: File? = null
+            try {
+                val result = withContext(Dispatchers.IO) { ArchiveCatalog.downloadPdf(item) { p -> downloadProgress = p } }
+                temp = result
+                val pageCount = withContext(Dispatchers.IO) { PdfSource(result).use { it.pageCount } }
+                if (pageCount <= 0) throw IllegalStateException("الملف لا يحتوي على صفحات PDF صالحة")
+                val id = dao.insertBook(BookEntity(title = item.title, author = item.creator))
+                val destination = File(booksDir(), "$id.pdf")
+                withContext(Dispatchers.IO) {
+                    if (!result.renameTo(destination)) result.copyTo(destination, overwrite = true)
+                    if (result.exists()) result.delete()
+                }
+                dao.setPageCount(id, pageCount)
+                startIndex(id)
+                message = "تم تنزيل «${item.title}» وإضافته إلى مكتبتك. ستبدأ فهرسته للبحث دون إنترنت."
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                temp?.delete()
+                catalogError = "فشل تنزيل الكتاب: ${e.message ?: "خطأ غير معروف"}"
+            } finally {
+                downloadingId = null
+                downloadProgress = 0
+            }
+        }
     }
 
     // ---------- البحث ----------
@@ -2684,6 +3242,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             searching = true
             val out = withContext(Dispatchers.Default) { runSearch(terms, m, scope, limit, radius) }
             lastTerms = out.second
+            hlTerms = out.second
             results = out.first
             searchedOnce = true
             searching = false
@@ -2753,6 +3312,302 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     suspend fun pageText(bookId: Long, pageNo: Int): String =
         dao.pageText(bookId, pageNo) ?: ""
+}
+__EOF__
+mkdir -p "$(dirname "app/src/main/java/com/bahith/pdf/Words.kt")"
+cat > "app/src/main/java/com/bahith/pdf/Words.kt" <<'__EOF__'
+package com.bahith.pdf
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.text.Html
+import android.util.LruCache
+import com.tom_roush.pdfbox.text.PDFTextStripper
+import com.tom_roush.pdfbox.text.TextPosition
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.io.File
+import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+
+/** كلمة على الصفحة: نصها بعد التطبيع، ومستطيلها نسبةً إلى الصفحة (0..1). */
+data class WordBox(val w: String, val x: Float, val y: Float, val ww: Float, val hh: Float)
+
+/** تخزين مواضع كلمات كل صفحة في ملف صغير (دون تغيير قاعدة البيانات). */
+object WordStore {
+    private fun dir(ctx: Context, bookId: Long) = File(ctx.filesDir, "words/$bookId")
+
+    fun save(ctx: Context, bookId: Long, pageNo: Int, boxes: List<WordBox>) {
+        try {
+            val d = dir(ctx, bookId)
+            d.mkdirs()
+            val f = File(d, "$pageNo.txt")
+            if (boxes.isEmpty()) {
+                f.delete()
+                return
+            }
+            val sb = StringBuilder(boxes.size * 24)
+            for (b in boxes) {
+                sb.append(b.w).append('\t')
+                    .append(String.format(Locale.US, "%.4f\t%.4f\t%.4f\t%.4f", b.x, b.y, b.ww, b.hh))
+                    .append('\n')
+            }
+            f.writeText(sb.toString())
+        } catch (_: Exception) {
+        }
+    }
+
+    fun load(ctx: Context, bookId: Long, pageNo: Int): List<WordBox> {
+        return try {
+            val f = File(dir(ctx, bookId), "$pageNo.txt")
+            if (!f.exists()) return emptyList()
+            val out = ArrayList<WordBox>()
+            f.forEachLine { line ->
+                val p = line.split('\t')
+                if (p.size >= 5) {
+                    val x = p[1].toFloatOrNull()
+                    val y = p[2].toFloatOrNull()
+                    val w = p[3].toFloatOrNull()
+                    val h = p[4].toFloatOrNull()
+                    if (x != null && y != null && w != null && h != null) out.add(WordBox(p[0], x, y, w, h))
+                }
+            }
+            out
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    fun deleteBook(ctx: Context, bookId: Long) {
+        try { dir(ctx, bookId).deleteRecursively() } catch (_: Exception) {}
+    }
+
+    fun deleteAll(ctx: Context) {
+        try { File(ctx.filesDir, "words").deleteRecursively() } catch (_: Exception) {}
+    }
+}
+
+/** يحدد الكلمات المطابقة للبحث على الصفحة (تطابق جزئي كما في تظليل النص). */
+fun matchBoxes(boxes: List<WordBox>, terms: List<String>): List<WordBox> {
+    if (terms.isEmpty() || boxes.isEmpty()) return emptyList()
+    val phrase = terms.size == 1 && terms[0].contains(' ')
+    if (!phrase) {
+        val out = ArrayList<WordBox>()
+        for (b in boxes) {
+            if (terms.any { t -> t.isNotEmpty() && b.w.contains(t) }) out.add(b)
+        }
+        return out
+    }
+    val toks = terms[0].split(' ').filter { it.isNotEmpty() }
+    if (toks.isEmpty()) return emptyList()
+    fun scan(list: List<WordBox>): List<WordBox> {
+        val out = ArrayList<WordBox>()
+        var i = 0
+        while (i + toks.size <= list.size) {
+            var ok = true
+            for (j in toks.indices) {
+                val w = list[i + j].w
+                val t = toks[j]
+                val good = when {
+                    toks.size == 1 -> w.contains(t)
+                    j == 0 -> w.endsWith(t)
+                    j == toks.size - 1 -> w.startsWith(t)
+                    else -> w == t
+                }
+                if (!good) {
+                    ok = false
+                    break
+                }
+            }
+            if (ok) {
+                for (j in toks.indices) out.add(list[i + j])
+                i += toks.size
+            } else {
+                i++
+            }
+        }
+        return out
+    }
+    val fwd = scan(boxes)
+    return if (fwd.isNotEmpty()) fwd else scan(boxes.reversed())
+}
+
+// ---------------------------------------------------------------------------------
+// استخراج مواضع الكلمات من طبقة النص الأصلية (في نفس تمريرة استخراج النص)
+// ---------------------------------------------------------------------------------
+
+class Glyph(val ch: String, val x: Float, val y: Float, val w: Float, val h: Float)
+
+class GlyphStripper : PDFTextStripper() {
+    val glyphs = ArrayList<Glyph>()
+
+    override fun processTextPosition(text: TextPosition) {
+        super.processTextPosition(text)
+        val u = text.unicode ?: return
+        if (u.isEmpty()) return
+        glyphs.add(Glyph(u, text.xDirAdj, text.yDirAdj, text.widthDirAdj, text.heightDir))
+    }
+}
+
+/** يجمّع المحارف إلى كلمات بمواضعها، بترتيب منطقي للعربية (من اليمين لليسار). */
+fun buildWords(glyphs: List<Glyph>, pageW: Float, pageH: Float): List<WordBox> {
+    if (glyphs.isEmpty() || pageW <= 1f || pageH <= 1f) return emptyList()
+    val base = ArrayList<Glyph>(glyphs.size)
+    for (g in glyphs) {
+        val s = java.text.Normalizer.normalize(g.ch, java.text.Normalizer.Form.NFKC)
+        if (s.isBlank()) continue
+        var markOnly = true
+        for (c in s) {
+            if (Character.getType(c) != Character.NON_SPACING_MARK.toInt()) {
+                markOnly = false
+                break
+            }
+        }
+        if (markOnly) continue
+        base.add(Glyph(s, g.x, g.y, g.w, g.h))
+    }
+    if (base.isEmpty()) return emptyList()
+
+    val sorted = base.sortedBy { it.y }
+    val lines = ArrayList<MutableList<Glyph>>()
+    for (g in sorted) {
+        val last = lines.lastOrNull()
+        if (last != null && abs(last[0].y - g.y) <= max(last[0].h, g.h) * 0.6f) last.add(g) else lines.add(mutableListOf(g))
+    }
+
+    val out = ArrayList<WordBox>()
+    for (line in lines) {
+        val ordered = line.sortedBy { it.x }
+        var arabic = 0
+        for (g in ordered) for (c in g.ch) if (c in '\u0600'..'\u06FF') arabic++
+        val rtl = arabic * 2 > ordered.size
+
+        var cur = ArrayList<Glyph>()
+        fun flush() {
+            if (cur.isEmpty()) return
+            val letters = if (rtl) cur.reversed() else cur
+            val sb = StringBuilder()
+            for (g in letters) sb.append(g.ch)
+            val norm = Arabic.normalize(sb.toString()).replace(" ", "")
+            if (norm.isNotEmpty()) {
+                var x0 = Float.MAX_VALUE
+                var x1 = 0f
+                var top = Float.MAX_VALUE
+                var hmax = 0f
+                for (g in cur) {
+                    x0 = min(x0, g.x)
+                    x1 = max(x1, g.x + g.w)
+                    top = min(top, g.y - g.h)
+                    hmax = max(hmax, g.h)
+                }
+                val bx = (x0 / pageW).coerceIn(0f, 1f)
+                val by = (top / pageH).coerceIn(0f, 1f)
+                val bw = ((x1 - x0) / pageW).coerceIn(0f, 1f)
+                val bh = (hmax * 1.35f / pageH).coerceIn(0f, 1f)
+                out.add(WordBox(norm, bx, by, bw, bh))
+            }
+            cur = ArrayList()
+        }
+        for (g in ordered) {
+            if (cur.isNotEmpty()) {
+                val prev = cur[cur.size - 1]
+                val gap = g.x - (prev.x + prev.w)
+                if (gap > g.h * 0.22f) flush()
+            }
+            cur.add(g)
+        }
+        flush()
+    }
+    return out
+}
+
+// ---------------------------------------------------------------------------------
+// مواضع الكلمات من نتيجة OCR (hOCR)
+// ---------------------------------------------------------------------------------
+
+private val SPAN = Regex("(?is)<span\\b([^>]*class=['\"][^'\"]*ocrx_word[^'\"]*['\"][^>]*)>(.*?)</span>")
+private val BBOX = Regex("bbox\\s+(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+(\\d+)")
+private val TAGS = Regex("(?is)<[^>]+>")
+
+fun parseHocr(hocr: String, imgW: Int, imgH: Int): List<WordBox> {
+    if (hocr.isBlank() || imgW <= 0 || imgH <= 0) return emptyList()
+    val out = ArrayList<WordBox>()
+    for (m in SPAN.findAll(hocr)) {
+        val bb = BBOX.find(m.groupValues[1]) ?: continue
+        val raw = TAGS.replace(m.groupValues[2], " ")
+        val word = Html.fromHtml(raw, Html.FROM_HTML_MODE_LEGACY).toString()
+        val norm = Arabic.normalize(word).replace(" ", "")
+        if (norm.isEmpty()) continue
+        val x0 = bb.groupValues[1].toFloatOrNull() ?: continue
+        val y0 = bb.groupValues[2].toFloatOrNull() ?: continue
+        val x1 = bb.groupValues[3].toFloatOrNull() ?: continue
+        val y1 = bb.groupValues[4].toFloatOrNull() ?: continue
+        out.add(
+            WordBox(
+                norm,
+                (x0 / imgW).coerceIn(0f, 1f),
+                (y0 / imgH).coerceIn(0f, 1f),
+                ((x1 - x0) / imgW).coerceIn(0f, 1f),
+                ((y1 - y0) / imgH).coerceIn(0f, 1f)
+            )
+        )
+    }
+    return out
+}
+
+// ---------------------------------------------------------------------------------
+// ذاكرة مؤقتة لصور الصفحات (تُستعمل لمقاطع نتائج البحث)
+// ---------------------------------------------------------------------------------
+
+object PageCache {
+    private val mutex = Mutex()
+    private val sources = object : LinkedHashMap<Long, PdfSource>(8, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, PdfSource>): Boolean {
+            if (size > 6) {
+                val v = eldest.value
+                Work.scope.launch { v.closeSafely() }
+                return true
+            }
+            return false
+        }
+    }
+    private val bitmaps = object : LruCache<String, Bitmap>(48 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount / 1024
+    }
+
+    suspend fun page(ctx: Context, bookId: Long, index: Int, width: Int): Bitmap? {
+        val key = "$bookId:$index:$width"
+        bitmaps.get(key)?.let { return it }
+        val src = try {
+            mutex.withLock {
+                sources.getOrPut(bookId) { PdfSource(File(ctx.filesDir, "books/$bookId.pdf")) }
+            }
+        } catch (e: Exception) {
+            return null
+        }
+        val b = src.render(index, width)
+        if (b != null) bitmaps.put(key, b)
+        return b
+    }
+
+    suspend fun drop(bookId: Long) {
+        mutex.withLock {
+            sources.remove(bookId)?.closeSafely()
+        }
+        val prefix = "$bookId:"
+        for (k in bitmaps.snapshot().keys) if (k.startsWith(prefix)) bitmaps.remove(k)
+    }
+
+    suspend fun dropAll() {
+        mutex.withLock {
+            for (s in sources.values) s.closeSafely()
+            sources.clear()
+        }
+        bitmaps.evictAll()
+    }
 }
 __EOF__
 mkdir -p "$(dirname "app/src/main/res/drawable/ic_fg.xml")"
