@@ -1,0 +1,356 @@
+#!/bin/bash
+set -e
+mkdir -p "$(dirname "app/build.gradle.kts")"
+cat > "app/build.gradle.kts" <<'__EOF__'
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
+    id("com.google.devtools.ksp")
+}
+
+android {
+    namespace = "com.bahith.pdf"
+    compileSdk = 34
+
+    defaultConfig {
+        applicationId = "com.bahith.pdf"
+        minSdk = 26
+        targetSdk = 34
+        versionCode = 20
+        versionName = "2.0"
+        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
+    }
+
+    signingConfigs {
+        create("fixed") {
+            storeFile = file("fixed.keystore")
+            storePassword = "bahith123"
+            keyAlias = "bahith"
+            keyPassword = "bahith123"
+        }
+    }
+    buildTypes {
+        getByName("debug") { signingConfig = signingConfigs.getByName("fixed") }
+    }
+
+    buildFeatures { compose = true }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = "17" }
+
+    packaging {
+        resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" }
+        jniLibs { useLegacyPackaging = true }
+    }
+}
+
+dependencies {
+    implementation(platform("androidx.compose:compose-bom:2024.09.00"))
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.activity:activity-compose:1.9.2")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
+
+    implementation("androidx.documentfile:documentfile:1.0.1")
+    implementation("androidx.room:room-runtime:2.6.1")
+    implementation("androidx.room:room-ktx:2.6.1")
+    ksp("androidx.room:room-compiler:2.6.1")
+
+    implementation("com.tom-roush:pdfbox-android:2.0.27.0")
+    implementation("cz.adaptech.tesseract4android:tesseract4android:4.7.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+}
+__EOF__
+
+mkdir -p "$(dirname "app/fixed.keystore")"
+base64 -d > "app/fixed.keystore" <<'__B64__'
+MIIKBAIBAzCCCa4GCSqGSIb3DQEHAaCCCZ8EggmbMIIJlzCCBa4GCSqGSIb3DQEHAaCCBZ8EggWb
+MIIFlzCCBZMGCyqGSIb3DQEMCgECoIIFQDCCBTwwZgYJKoZIhvcNAQUNMFkwOAYJKoZIhvcNAQUM
+MCsEFO4jvMbdFL5m/Pt2zjMYKvat/BOYAgInEAIBIDAMBggqhkiG9w0CCQUAMB0GCWCGSAFlAwQB
+KgQQV5+ecOa4XjiLsW4X9AyF+gSCBNA8JC1P36CuXGWvBGn4qVMybOxyY6FmYLtyT3kLUdjR9TxW
+/6WmD64/CzlnkbtmW3CYFLdkU7MqKfSin83dyAdJdwQZmng1xIuw2As4arPO/nfq6apwqIDMLFq9
+fH9cCQcql2xqUR+1Enpwykh2rV0yrBa0ZdcMhjz7KuG8KLtoX+60yxs76sshG9SXzgNT9d+iMegw
+9sHKAa2w3DgkFw9t2nyceIBTkacL39KWIJjm1mACJDhhvdphAL+YXnhfVP8YUJwlo87eBz+lYeOk
+EcEVf10coFEN1xWnT1Iq4fT/VfAibL2CryJaUBjNQ6IXDNZ4kxO/NYMeYUZIZuLeC7EGViO3X7E4
+jxY7BYqaEyx6yvSayXkCPDn8umS7K9rhjCzGtxe1xizN3czPHFrkCo6HH+ZuZMUSg/I4vKVxIK4+
+m7TJhqXmkZXbfI9lcusuQJB88HgWQMd3sn5srNaEvAIWq0JolvstISM/klQtvadaRzthX+Gu8eXD
+iJtyDUuCdj2zRgLOStU6fXLBziHd4SeiKcEaMBTYXGeJ4baZhrGRHy7IYvC8RhE8Nyt12pFfahae
+gqFVOxzn0VqszHZSYNyGmsROAtL3TWD846d1cEymSSdnUVO8/HVos5kq1E+pGKUWP9fDjwBLlFcg
+B3+Y35lUuBLdkKUIhDi/UkmEsGjYer7F3An9yXksngGXCiAkGHY1VAcbNvCaQA3zcS7T8VHrg1fW
+f60jCT4talMN2NtOyg4AaThLiKy1fe7GED8PbCPjsmU4ZUF9aoejcH+4y1A9Xi0b4N+UNdPjQfae
+T0C2cWlPu+lWDnBt+QMn9aG4WMX3eGEopYGOhaGbQXeA93A1ZjXyGEJANCf3cdkW7WGvqb7gf1nF
+JMlzAEcizJ7EC/ha4+6s9z7cLA75sm+yL+37yA3QdQWw2dixELw/rhZcE06vukTTADMUu8AXFkdZ
+zMNjgnN4WmV7DulvPRWhgz5razhVd/43JPZ/OtbYapnR3nSjIvQMby/EV84FY3rM/f3oRXFVfxTi
+s/ulTxrxlxavej1kYdC5MvDDQ7sYkMMp9dQ8vwYLvhDBrB8X4gk8twe4nQryZzDcuziM+Gk2sIyV
+FqpRocASCzPw9URT9knvxDjR4VFa+i0jxkclvkKZiFFzQgAMBvGpDQMr0edGYUQmUOUhEGrxtcEc
+tkn44MOl4VVo2o4+IomfJlFUJiU6TF+bpJpcEf5L6IbT/B/HSlRikeREvhvlzIGwF2RSWwnRasGe
+CJA82lRn3zpCjx2S+OTwzwZsZqdoCHiLjzCt74ErlElcYYWoSNQEItDnkl+uwMfqF54S56npDXfM
+PEJO7lyYzhaPPDukBtaoPcmk16D9LgaVoLIAsdjhnf3eCf2RutPrYWcw5WOhWyhpHSfPdfxTSJnt
+7l0bKLCK/8GWav0h9fhS0mTcFpBMZCTg1ZZrgNgwUVOyG6lBiv9UEfA/RNDOAri4mDwo7c7VkimZ
+ChhEIbAL7g0F6ZiARrQ6tqMzF9STHthumqA35N2wio6A7ky43gNu4okS4FKq/QsoOY+wz+meurzF
+ZWT49z55LflFb7J0WfrS7SciBF1WL5MkBMcXD9d7CNxdWIfqCTPQb8o7POhh4ULsO/ZdD8AHteK7
+MTFAMBsGCSqGSIb3DQEJFDEOHgwAYgBhAGgAaQB0AGgwIQYJKoZIhvcNAQkVMRQEElRpbWUgMTc5
+NDE3NTg3NDEwOTCCA+EGCSqGSIb3DQEHBqCCA9IwggPOAgEAMIIDxwYJKoZIhvcNAQcBMGYGCSqG
+SIb3DQEFDTBZMDgGCSqGSIb3DQEFDDArBBQxyBC4WwnR8rtmo5Lamk+0Hu6W9AICJxACASAwDAYI
+KoZIhvcNAgkFADAdBglghkgBZQMEASoEEPcyBhQeTSxs3MDBMzQKRISAggNQTZU8J9svxroMhoR9
+3Qy6kSNANwfrhqmMwvD0gEPizxrJVJHQDlrVEISF3zP/dGzhqgsPFmZVI9WDf6HBlW14ggXZj6NO
+Mt67oH3euHV3UIQdGkBSxi9Aq0/5b+T44jkvJwhm3AizSW5fLYikI05rKUZO/cd/4wmwV3E1uJpU
+3ms0eQyhhQwACkktPMundphiXnZhfQ8d0BBMPCoEsr946RWNxmBwx734nYh4oldvhjUc1bBbbmVz
+GCpwjkR+iMrTidDxyFq3y8OAh+CH3P0tCLUUghDFsZOzcRd0ihyYIf9dRIue3EFXKA2WMDeYg7ge
+gbnQvu1CZ/TFZ0t8Z/ZVYlXSpx12nvOSm1zVZXent2HiF2NR7SsCIXM4rOB8PLj34n9D/GuMsU3C
+pPuCmtk6goewu1RCH1VovZrn3b7rciU5rqO40gxFWE4vZOhig9ATAfDR/lxNrxQJLA4JOGPeU8bq
+KsxY5Xc+gVKOv5BpA0yXSbbgIMEqN4TbTYZYOEhpLAiS6UYmFBUE2d20Jp6c8wuFz+xno0tSqTlJ
+PXVd+1ev+ItGRpwBeuTNRVl2n1yk2Ni7TaHcRh7c8Wm6eglVH8lldVy4e6RpcF+4dMrbCHEeiuyg
+XIqZ/C94HLfy4TtxMF0r1H1IfDbiP1XZ/Lo0AMNxnvGVb9y/YdAtsHED87dxbUB7uQWBUzaRj0Vh
+RWQ/5RVxvrYi+vzR4gxsElOI1KDn2RQBqsUVn8M8Ca2qUyDuFck6/cFTpXBS0LXp13bInJYCB3Mh
+zSPaTMC1TB/+G05s9yBxC9ARJJPvkLRcCFOoq2xS8iJKRNINNe4WW0yByByHhtIVcTggyuMLISK8
+C/X99m4TYLQe46nb+a8QO036Uf+7xybiFsTiSFf+tmcwF+I/6VCJLfsftHUzOMMlhGJ14i5OwTPV
+Gp+P/5hI4eMy2XIYFmHTupkdhsgWI9xmC6sl+jJiot74A3I5FYRChxwG+8QYybYOT8xqnICb1MbN
+PINZmPOHE0rpLbi2in15at6yxT3mvLu1GnV0zeSOoq9cg83+ndjkauBMBXjA7/vNGll2JhSrVyIJ
+YcRVhGIJlGxgccon9iOdRTt91tdfQ2a4fybSLyO5LM1DGB3E/PAwTTAxMA0GCWCGSAFlAwQCAQUA
+BCAZJQQnZAejcx+/apw04xc2ElvFfERRUrH12CzJ8zj/eAQUpj23RRNuPmbpWLWcSdIkXGzvwe8C
+AicQ
+__B64__
+
+mkdir -p "$(dirname "app/src/main/AndroidManifest.xml")"
+cat > "app/src/main/AndroidManifest.xml" <<'__EOF__'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+        android:allowBackup="true"
+        android:label="باحث PDF"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:supportsRtl="true"
+        android:largeHeap="true"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <service
+            android:name=".IndexService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:mimeType="application/pdf" />
+                <data android:mimeType="application/epub+zip" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/pdf" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+__EOF__
+
+mkdir -p "$(dirname "app/src/main/java/com/bahith/pdf/ShamelLibrary.kt")"
+cat > "app/src/main/java/com/bahith/pdf/ShamelLibrary.kt" <<'__EOF__'
+package com.bahith.pdf
+
+import android.net.Uri
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+
+data class ShamelBookItem(
+    val id: String,
+    val title: String,
+    val author: String,
+    val category: String,
+    val downloadUrl: String
+)
+
+object ShamelLibraryAPI {
+    suspend fun search(query: String): List<ShamelBookItem> = withContext(Dispatchers.IO) {
+        val encoded = Uri.encode(query)
+        val url = "https://shamela.ws/api/v1/search?q=$encoded"
+        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 15000
+            readTimeout = 30000
+            requestMethod = "GET"
+            setRequestProperty("User-Agent", "BahithPDF/2.0 (Android Shamel Integration)")
+        }
+        try {
+            val code = connection.responseCode
+            if (code !in 200..299) return@withContext emptyList()
+            val body = connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            val root = JSONObject(body)
+            val items = root.optJSONArray("data") ?: return@withContext emptyList()
+            buildList {
+                for (i in 0 until items.length()) {
+                    val obj = items.optJSONObject(i) ?: continue
+                    add(ShamelBookItem(
+                        id = obj.optString("id"),
+                        title = obj.optString("title"),
+                        author = obj.optString("author", "غير معروف"),
+                        category = obj.optString("category", "عام"),
+                        downloadUrl = obj.optString("download_url")
+                    ))
+                }
+            }
+        } catch (e: Exception) {
+            emptyList()
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    suspend fun downloadBook(item: ShamelBookItem, onProgress: (Int) -> Unit): File = withContext(Dispatchers.IO) {
+        val connection = (URL(item.downloadUrl).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 20000
+            readTimeout = 60000
+            setRequestProperty("User-Agent", "BahithPDF/2.0 (Android)")
+        }
+        val out = File.createTempFile("shamel_", ".pdf")
+        try {
+            val code = connection.responseCode
+            if (code !in 200..299) throw IllegalStateException("خطأ في الاتصال بالتحميل: HTTP $code")
+            val total = connection.contentLengthLong
+            connection.inputStream.use { input ->
+                out.outputStream().buffered().use { output ->
+                    val buffer = ByteArray(64 * 1024)
+                    var count: Int
+                    var received = 0L
+                    while (input.read(buffer).also { count = it } >= 0) {
+                        if (count == 0) continue
+                        output.write(buffer, 0, count)
+                        received += count
+                        if (total > 0) onProgress(((received * 100) / total).toInt().coerceIn(0, 99))
+                    }
+                }
+            }
+            onProgress(100)
+            out
+        } catch (e: Exception) {
+            out.delete()
+            throw e
+        } finally {
+            connection.disconnect()
+        }
+    }
+}
+__EOF__
+
+mkdir -p "$(dirname "app/src/main/java/com/bahith/pdf/Ui.kt")"
+cat > "app/src/main/java/com/bahith/pdf/Ui.kt" <<'__EOF__'
+package com.bahith.pdf
+
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+
+@Composable
+fun ShamelSearchDownloadScreen(vm: AppViewModel) {
+    Column(Modifier.fillMaxSize().padding(16.dp)) {
+        Text("المكتبة الشاملة - بحث وتنزيل", style = MaterialTheme.typography.headlineSmall)
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            value = vm.catalogQuery,
+            onValueChange = { vm.catalogQuery = it },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("ابحث عن كتاب في المكتبة الشاملة...") },
+            singleLine = true
+        )
+        Button(
+            onClick = { vm.searchShamelCatalog() },
+            modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+        ) {
+            Text("بحث في المكتبة الشاملة")
+        }
+        if (vm.catalogLoading) {
+            LinearProgressIndicator(Modifier.fillMaxWidth().padding(top = 8.dp))
+        }
+        Spacer(Modifier.height(12.dp))
+        LazyColumn(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            items(vm.shamelResults, key = { it.id }) { item ->
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text(item.title, style = MaterialTheme.typography.titleMedium)
+                        Text("المؤلف: ${item.author} | التصنيف: ${item.category}", style = MaterialTheme.typography.bodySmall)
+                        TextButton(onClick = { vm.downloadShamelBook(item) }) {
+                            Text("تنزيل وإضافة للمكتبة المحلية")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+__EOF__
+
+mkdir -p "$(dirname "build.gradle.kts")"
+cat > "build.gradle.kts" <<'__EOF__'
+plugins {
+    id("com.android.application") version "8.5.2" apply false
+    id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+    id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+    id("com.google.devtools.ksp") version "2.0.21-1.0.28" apply false
+}
+__EOF__
+
+mkdir -p "$(dirname "gradle.properties")"
+cat > "gradle.properties" <<'__EOF__'
+org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+android.useAndroidX=true
+kotlin.code.style=official
+android.nonTransitiveRClass=true
+__EOF__
+
+mkdir -p "$(dirname "settings.gradle.kts")"
+cat > "settings.gradle.kts" <<'__EOF__'
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+        maven { url = uri("https://jitpack.io") }
+    }
+}
+rootProject.name = "BahithPDF"
+include(":app")
+__EOF__
+
+mkdir -p app/src/main/assets/tessdata app/src/main/assets/lexicon
+curl -L --fail --retry 3 -o app/src/main/assets/tessdata/ara_best.traineddata https://github.com/tesseract-ocr/tessdata_best/raw/main/ara.traineddata || true
+curl -L --fail --retry 3 -o app/src/main/assets/lexicon/arabic-words.txt https://raw.githubusercontent.com/MustafaLinux/arabic-words-list/main/arabic-words.txt || true
+ls -l app/src/main/assets/tessdata app/src/main/assets/lexicon || true
