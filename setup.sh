@@ -17,8 +17,8 @@ android {
         applicationId = "com.bahith.pdf"
         minSdk = 26
         targetSdk = 34
-        versionCode = 9
-        versionName = "1.7"
+        versionCode = 10
+        versionName = "1.8"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
 
@@ -497,6 +497,90 @@ abstract class AppDb : RoomDatabase() {
     }
 }
 __EOF__
+mkdir -p "$(dirname "app/src/main/java/com/bahith/pdf/Formulas.kt")"
+cat > "app/src/main/java/com/bahith/pdf/Formulas.kt" <<'__EOF__'
+package com.bahith.pdf
+
+/**
+ * يصلح صيغ الثناء والترضّي المعكوسة في النص المستخرج من ملفات PDF
+ * (مثل «ملسو هيلع هللا ىلص» ← «صلى الله عليه وسلم»). قاعدة قاطعة لا تعتمد على معجم.
+ */
+object Formulas {
+    @Volatile var on = true
+
+    private val FORMS = listOf(
+        "صلى الله عليه وسلم",
+        "صلى الله عليه وآله وسلم",
+        "عليه الصلاة والسلام",
+        "عليه السلام",
+        "عليهم السلام",
+        "رضي الله عنه",
+        "رضي الله عنها",
+        "رضي الله عنهم",
+        "رضي الله عنهما",
+        "رحمه الله تعالى",
+        "رحمه الله",
+        "رحمها الله",
+        "رحمهم الله",
+        "تبارك وتعالى",
+        "سبحانه وتعالى",
+        "عز وجل",
+        "جل جلاله"
+    )
+
+    private class Rule(val re: Regex, val to: String)
+
+    private fun letterClass(c: Char): String = when (c) {
+        'ا' -> "[اأإآٱ]"
+        'ي', 'ى' -> "[يى]"
+        'ه', 'ة' -> "[هة]"
+        else -> Regex.escape(c.toString())
+    }
+
+    private fun pattern(s: String): String {
+        val marks = "[\\u064B-\\u065F\\u0670\\u0640]*"
+        val sb = StringBuilder("(?<![\\u0621-\\u064A])")
+        for (c in s) {
+            if (c == ' ') {
+                sb.append("\\s+")
+            } else {
+                sb.append(letterClass(c))
+                sb.append(marks)
+            }
+        }
+        sb.append("(?![\\u0621-\\u064A])")
+        return sb.toString()
+    }
+
+    private val rules: List<Rule> by lazy {
+        val out = ArrayList<Rule>()
+        val seen = HashSet<String>()
+        for (f in FORMS) {
+            val words = f.split(' ')
+            val variants = listOf(
+                f.reversed(),
+                words.joinToString(" ") { it.reversed() },
+                words.reversed().joinToString(" ")
+            )
+            for (v in variants) {
+                if (v == f || !seen.add(v)) continue
+                try {
+                    out.add(Rule(Regex(pattern(v)), f))
+                } catch (_: Exception) {
+                }
+            }
+        }
+        out
+    }
+
+    fun fix(text: String): String {
+        if (!on || text.length < 8) return text
+        var t = text
+        for (r in rules) t = r.re.replace(t, r.to)
+        return t
+    }
+}
+__EOF__
 mkdir -p "$(dirname "app/src/main/java/com/bahith/pdf/Lexicon.kt")"
 cat > "app/src/main/java/com/bahith/pdf/Lexicon.kt" <<'__EOF__'
 package com.bahith.pdf
@@ -507,12 +591,25 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
+import java.io.BufferedReader
+import java.io.DataInputStream
+import java.io.DataOutputStream
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.InputStream
+import java.io.InputStreamReader
 import java.util.concurrent.ConcurrentHashMap
 
 /**
  * معجم لغوي يُستعمل لتحسين البحث في صفحات الـ OCR فقط.
- * لا يغيّر نص الكتاب المعروض أبداً؛ يغيّر عمود البحث (norm) ومواضع الكلمات للتظليل.
+ * لا يغيّر صورة الصفحة، ولا يغيّر عمود البحث إلا للكلمات غير المعروفة.
+ *
+ * يتألف من:
+ *  - معجم كبير (ملايين الكلمات) يُخزَّن كبصمات 64 بت مرتبة (نحو 8 بايت للكلمة).
+ *  - كلمات متعلَّمة من كتبك مع عدد تكرارها (تُستعمل للترجيح بين الاقتراحات).
  */
 object Lexicon {
     @Volatile var on = true
@@ -521,21 +618,67 @@ object Lexicon {
     @Volatile var maxWords = 600_000
     @Volatile var learn = true
     @Volatile var learnOcr = true
+    @Volatile var guessSalawat = true
 
     var learnedSize by mutableIntStateOf(0)
-    var importedSize by mutableIntStateOf(0)
+    var baseSize by mutableIntStateOf(0)
     var busy by mutableStateOf(false)
+    var status by mutableStateOf("")
 
     private val learned = ConcurrentHashMap<String, Int>()
-    private val imported = ConcurrentHashMap<String, Int>()
-    private val skel = ConcurrentHashMap<String, String>()
 
-    @Volatile private var skelDirty = true
-    @Volatile private var skelAt = 0L
+    @Volatile private var base = LongArray(0)
     @Volatile private var loaded = false
+    private val baseLock = Any()
     private var dir: File? = null
 
-    private const val ALPHA = "ابتثجحخدذرزسشصضطظعغفقكلمنهويءئؤةى"
+    private const val ALPHA = "ابتثجحخدذرزسشصضطظعغفقكلمنهويء"
+    private const val BASE_ASSET = "lexicon/arabic-words.txt"
+
+    // مجموعات الحروف المتشابهة في الرسم (التي يخلط بينها الـ OCR كثيراً)
+    private val GROUP_OF: Map<Char, String> = HashMap<Char, String>().also { m ->
+        for (g in listOf("بتثني", "جحخ", "دذ", "رز", "سش", "صض", "طظ", "عغ", "فق", "وم")) {
+            for (c in g) m[c] = g
+        }
+    }
+
+    // ---------------- أدوات الحروف ----------------
+
+    private fun cf(c: Char): Char = when (c) {
+        'أ', 'إ', 'آ', 'ٱ' -> 'ا'
+        'ى', 'ئ' -> 'ي'
+        'ؤ' -> 'و'
+        'ة', 'ۃ', 'ۀ', 'ھ' -> 'ه'
+        'ی' -> 'ي'
+        'ک' -> 'ك'
+        else -> c
+    }
+
+    /** صيغة موحّدة للكلمة (لا تعتمد على خيارات البحث). */
+    fun canon(s: String): String {
+        val sb = StringBuilder(s.length)
+        for (c in s) sb.append(cf(c))
+        return sb.toString()
+    }
+
+    private fun hash(s: CharSequence): Long {
+        var x = -3750763034362895579L
+        for (i in 0 until s.length) x = (x xor s[i].code.toLong()) * 1099511628211L
+        return x
+    }
+
+    private fun isArabicWord(t: String): Boolean {
+        if (t.isEmpty()) return false
+        for (c in t) if (c !in '\u0621'..'\u064A') return false
+        return true
+    }
+
+    private fun baseContains(w: String): Boolean {
+        val b = base
+        return b.isNotEmpty() && java.util.Arrays.binarySearch(b, hash(w)) >= 0
+    }
+
+    val baseReady: Boolean get() = base.isNotEmpty()
 
     // ---------------- التحميل والحفظ ----------------
 
@@ -546,42 +689,19 @@ object Lexicon {
             val d = File(ctx.applicationContext.filesDir, "lexicon")
             d.mkdirs()
             dir = d
-            readFile(File(d, "learned.tsv"), learned)
-            readFile(File(d, "imported.tsv"), imported)
-            loaded = true
-            skelDirty = true
-            refreshSizes()
-        }
-    }
-
-    private fun readFile(f: File, into: MutableMap<String, Int>) {
-        if (!f.exists()) return
-        try {
-            f.forEachLine { line ->
-                val i = line.indexOf('\t')
-                if (i > 0) into[line.substring(0, i)] = line.substring(i + 1).toIntOrNull() ?: 1
-            }
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun writeFile(f: File, from: Map<String, Int>) {
-        try {
-            f.bufferedWriter().use { w ->
-                for ((k, v) in from) {
-                    w.write(k)
-                    w.write("\t")
-                    w.write(v.toString())
-                    w.newLine()
+            val f = File(d, "learned.tsv")
+            if (f.exists()) {
+                try {
+                    f.forEachLine { line ->
+                        val i = line.indexOf('\t')
+                        if (i > 0) learned[line.substring(0, i)] = line.substring(i + 1).toIntOrNull() ?: 1
+                    }
+                } catch (_: Exception) {
                 }
             }
-        } catch (_: Exception) {
+            loaded = true
+            learnedSize = learned.size
         }
-    }
-
-    private fun refreshSizes() {
-        learnedSize = learned.size
-        importedSize = imported.size
     }
 
     private fun prune() {
@@ -592,179 +712,302 @@ object Lexicon {
     fun saveLearned() {
         val d = dir ?: return
         prune()
-        writeFile(File(d, "learned.tsv"), learned)
-        skelDirty = true
-        refreshSizes()
+        try {
+            File(d, "learned.tsv").bufferedWriter().use { w ->
+                for ((k, v) in learned) {
+                    w.write(k)
+                    w.write("\t")
+                    w.write(v.toString())
+                    w.newLine()
+                }
+            }
+        } catch (_: Exception) {
+        }
+        learnedSize = learned.size
     }
 
     fun clearLearned() {
         learned.clear()
         dir?.let { File(it, "learned.tsv").delete() }
-        skelDirty = true
-        refreshSizes()
+        learnedSize = 0
     }
 
-    fun clearImported() {
-        imported.clear()
-        dir?.let { File(it, "imported.tsv").delete() }
-        skelDirty = true
-        refreshSizes()
+    fun clearBase() {
+        synchronized(baseLock) {
+            base = LongArray(0)
+            baseSize = 0
+            dir?.let {
+                File(it, "base.bin").delete()
+                try { File(it, "base.off").writeText("1") } catch (_: Exception) {}
+            }
+        }
+    }
+
+    // ---------------- المعجم الكبير ----------------
+
+    private fun loadBase(f: File): Boolean {
+        return try {
+            DataInputStream(BufferedInputStream(FileInputStream(f), 1 shl 16)).use { d ->
+                val n = d.readInt()
+                val a = LongArray(n)
+                for (i in 0 until n) a[i] = d.readLong()
+                base = a
+                baseSize = n
+            }
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /** يبني ملف المعجم الكبير من تدفق نصي (كل سطر كلمة؛ أول رمز في السطر). */
+    private fun buildBase(input: InputStream, out: File): Int {
+        var arr = LongArray(1 shl 20)
+        var n = 0
+        val sb = StringBuilder(24)
+        BufferedReader(InputStreamReader(input, Charsets.UTF_8), 1 shl 16).use { r ->
+            while (true) {
+                val line = r.readLine() ?: break
+                sb.setLength(0)
+                var ok = true
+                for (ch in line) {
+                    if (ch == ' ' || ch == '\t' || ch == ',' || ch == ';') {
+                        if (sb.isNotEmpty()) break else continue
+                    }
+                    if (Character.getType(ch) == Character.NON_SPACING_MARK.toInt() || ch == 'ـ') continue
+                    val c = cf(ch)
+                    if (c !in '\u0621'..'\u064A') {
+                        ok = false
+                        break
+                    }
+                    sb.append(c)
+                }
+                if (!ok || sb.length < 2 || sb.length > 24) continue
+                if (n == arr.size) arr = arr.copyOf(arr.size * 2)
+                arr[n++] = hash(sb)
+                if (n % 250_000 == 0) status = "جارٍ تجهيز المعجم الكبير… $n كلمة"
+            }
+        }
+        java.util.Arrays.sort(arr, 0, n)
+        var m = 0
+        var last = 0L
+        for (i in 0 until n) {
+            val v = arr[i]
+            if (m == 0 || v != last) {
+                arr[m++] = v
+                last = v
+            }
+        }
+        val tmp = File(out.parentFile, "base.tmp")
+        DataOutputStream(BufferedOutputStream(FileOutputStream(tmp), 1 shl 16)).use { d ->
+            d.writeInt(m)
+            for (i in 0 until m) d.writeLong(arr[i])
+        }
+        out.delete()
+        tmp.renameTo(out)
+        base = arr.copyOf(m)
+        baseSize = m
+        return m
+    }
+
+    /** يجهّز المعجم الكبير من القائمة المرفقة مع التطبيق (مرة واحدة). */
+    fun ensureBase(ctx: Context) {
+        ensureLoaded(ctx)
+        if (base.isNotEmpty()) return
+        synchronized(baseLock) {
+            if (base.isNotEmpty()) return
+            val d = dir ?: return
+            if (File(d, "base.off").exists()) return
+            val f = File(d, "base.bin")
+            if (f.exists() && loadBase(f)) return
+            val has = try {
+                ctx.assets.open(BASE_ASSET).close()
+                true
+            } catch (_: Exception) {
+                false
+            }
+            if (!has) return
+            busy = true
+            status = "جارٍ تجهيز المعجم الكبير…"
+            try {
+                ctx.assets.open(BASE_ASSET).use { buildBase(it, f) }
+                status = ""
+            } catch (e: Exception) {
+                status = "تعذّر تجهيز المعجم الكبير: ${e.message ?: "خطأ"}"
+            } finally {
+                busy = false
+            }
+        }
+    }
+
+    /** يستبدل المعجم الكبير بقائمة يختارها المستخدم (ملف نصي: كلمة في كل سطر). */
+    fun importList(ctx: Context, uri: Uri): Int {
+        ensureLoaded(ctx)
+        val d = dir ?: return 0
+        return synchronized(baseLock) {
+            File(d, "base.off").delete()
+            status = "جارٍ تجهيز المعجم الكبير…"
+            val n = ctx.contentResolver.openInputStream(uri)?.use { buildBase(it, File(d, "base.bin")) } ?: 0
+            status = ""
+            n
+        }
+    }
+
+    /** يستورد نصاً مرجعياً (مثل المصحف أو كتاب): كلماته تُضاف للمتعلَّم بوزن قوي. */
+    fun importText(ctx: Context, uri: Uri): Int {
+        ensureLoaded(ctx)
+        var added = 0
+        ctx.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { r ->
+            while (true) {
+                val line = r.readLine() ?: break
+                val norm = Arabic.normalize(line)
+                for (t0 in norm.split(' ')) {
+                    val t = canon(t0)
+                    if (t.length < 2 || t.length > 24 || !isArabicWord(t)) continue
+                    learned.merge(t, 20) { a, b -> a + b }
+                    added++
+                }
+            }
+        }
+        saveLearned()
+        return added
     }
 
     // ---------------- التعلّم ----------------
 
-    private fun isArabicWord(t: String): Boolean {
-        if (t.isEmpty()) return false
-        for (c in t) if (c !in '\u0621'..'\u064A') return false
-        return true
-    }
-
-    private fun addWord(t: String, n: Int) {
+    private fun addWord(t0: String, n: Int) {
+        val t = canon(t0)
         if (t.length < 2 || t.length > 20 || !isArabicWord(t)) return
         learned.merge(t, n) { a, b -> a + b }
     }
 
-    /** يتعلم من نص صفحة سليمة (نص بعد التطبيع). */
     fun learnNorm(norm: String, force: Boolean = false) {
         if ((!learn && !force) || norm.isEmpty()) return
         for (t in norm.split(' ')) addWord(t, 1)
-        skelDirty = true
     }
 
-    /** يتعلم من كلمات الـ OCR التي ثقتها عالية فقط. */
     fun learnBoxes(boxes: List<WordBox>) {
         if (!learnOcr) return
         for (b in boxes) if (b.conf >= 90) addWord(b.w, 1)
-        skelDirty = true
-    }
-
-    // ---------------- الاستيراد ----------------
-
-    /** يستورد قائمة كلمات: كل سطر «كلمة» أو «كلمة [فاصل] تكرار». يعيد عدد الكلمات المستوردة. */
-    fun importList(ctx: Context, uri: Uri): Int {
-        ensureLoaded(ctx)
-        val tmp = HashMap<String, Int>()
-        var hasCounts = false
-        val limit = (maxWords * 1.3).toInt()
-        ctx.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { r ->
-            while (true) {
-                val line = r.readLine() ?: break
-                val s = line.trim()
-                if (s.isEmpty()) continue
-                val parts = s.split(Regex("[\\s,;\\t]+"))
-                val w = Arabic.normalize(parts[0]).replace(" ", "")
-                if (w.length < 2 || w.length > 20 || !isArabicWord(w)) continue
-                val c = if (parts.size > 1) parts[1].toIntOrNull() else null
-                if (c != null) hasCounts = true
-                val add = c ?: 10
-                tmp.merge(w, add) { a, b -> a + b }
-                if (!hasCounts && tmp.size >= maxWords) break
-                if (tmp.size >= limit) break
-            }
-        }
-        var entries = tmp.entries.toList()
-        if (entries.size > maxWords) entries = entries.sortedByDescending { it.value }.take(maxWords)
-        imported.clear()
-        for (e in entries) imported[e.key] = e.value
-        dir?.let { writeFile(File(it, "imported.tsv"), imported) }
-        skelDirty = true
-        refreshSizes()
-        return imported.size
     }
 
     // ---------------- التصحيح ----------------
 
-    fun cnt(w: String): Int = (learned[w] ?: 0) + (imported[w] ?: 0)
+    private fun isValid(w: String): Boolean = (learned[w] ?: 0) >= minCount || baseContains(w)
 
-    private fun skelChar(c: Char): Char = when (c) {
-        'ب', 'ت', 'ث', 'ن', 'ي', 'ى', 'ئ' -> 'ب'
-        'ج', 'ح', 'خ' -> 'ح'
-        'د', 'ذ' -> 'د'
-        'ر', 'ز' -> 'ر'
-        'س', 'ش' -> 'س'
-        'ص', 'ض' -> 'ص'
-        'ط', 'ظ' -> 'ط'
-        'ع', 'غ' -> 'ع'
-        'ف', 'ق' -> 'ف'
-        'ه', 'ة' -> 'ه'
-        'و', 'ؤ' -> 'و'
-        'ا', 'أ', 'إ', 'آ' -> 'ا'
-        else -> c
-    }
-
-    private fun skeleton(w: String): String {
-        val sb = StringBuilder(w.length)
-        for (c in w) sb.append(skelChar(c))
-        return sb.toString()
-    }
-
-    private fun ensureSkeleton() {
-        val now = System.currentTimeMillis()
-        if (!skelDirty && skel.isNotEmpty()) return
-        if (skel.isNotEmpty() && now - skelAt < 120_000) return
-        synchronized(skel) {
-            val tmp = HashMap<String, String>()
-            val best = HashMap<String, Int>()
-            fun feed(k: String) {
-                val c = cnt(k)
-                if (c < minCount) return
-                val s = skeleton(k)
-                if (c > (best[s] ?: 0)) {
-                    best[s] = c
-                    tmp[s] = k
-                }
-            }
-            for (k in learned.keys) feed(k)
-            for (k in imported.keys) feed(k)
-            skel.clear()
-            skel.putAll(tmp)
-            skelDirty = false
-            skelAt = now
-        }
-    }
+    private class Cand(val w: String, val cost: Int, val lc: Int)
 
     private fun suggest(w: String): String? {
-        var best: String? = null
-        var bestC = 0
-        fun consider(c: String) {
-            val n = cnt(c)
-            if (n >= minSuggest && n > bestC) {
-                bestC = n
-                best = c
-            }
+        val found = ArrayList<Cand>()
+        val seen = HashSet<String>()
+        fun test(c: String, cost: Int) {
+            if (found.size > 400 || c == w || !seen.add(c)) return
+            val lc = learned[c] ?: 0
+            if (lc >= minCount || baseContains(c)) found.add(Cand(c, cost, lc))
         }
         val n = w.length
         if (n >= 4) {
-            for (i in 0 until n) consider(w.substring(0, i) + w.substring(i + 1))
-            for (i in 0 until n - 1) consider(w.substring(0, i) + w[i + 1] + w[i] + w.substring(i + 2))
-            for (i in 0 until n) for (ch in ALPHA) if (ch != w[i]) consider(w.substring(0, i) + ch + w.substring(i + 1))
-            for (i in 0..n) for (ch in ALPHA) consider(w.substring(0, i) + ch + w.substring(i))
-            if (best != null) return best
+            for (i in 0 until n) test(w.substring(0, i) + w.substring(i + 1), 1)
+            for (i in 0 until n - 1) test(w.substring(0, i) + w[i + 1] + w[i] + w.substring(i + 2), 1)
+            for (i in 0 until n) for (ch in ALPHA) if (ch != w[i]) test(w.substring(0, i) + ch + w.substring(i + 1), 1)
+            for (i in 0..n) for (ch in ALPHA) test(w.substring(0, i) + ch + w.substring(i), 1)
         }
-        ensureSkeleton()
-        val c = skel[skeleton(w)] ?: return null
-        return if (c != w && cnt(c) >= minSuggest) c else null
+        // استبدال حروف متشابهة الرسم (نقاط/شكل): حتى 3 حروف للكلمات الطويلة
+        val chars = w.toCharArray()
+        val maxSubs = if (n >= 5) 3 else 2
+        var count = 0
+        fun rec(start: Int, subs: Int) {
+            for (i in start until chars.size) {
+                val g = GROUP_OF[chars[i]] ?: continue
+                val orig = chars[i]
+                for (alt in g) {
+                    if (alt == orig) continue
+                    chars[i] = alt
+                    count++
+                    test(String(chars), subs + 1)
+                    if (subs + 1 < maxSubs && count < 6000) rec(i + 1, subs + 1)
+                    chars[i] = orig
+                    if (count >= 6000) return
+                }
+            }
+        }
+        rec(0, 0)
+
+        if (found.isEmpty()) return null
+        val strong = found.filter { it.lc >= minSuggest }
+        if (strong.isNotEmpty()) return strong.maxByOrNull { it.lc * 4 - it.cost }!!.w
+        if (!baseReady) return null
+        val minCost = found.minOf { it.cost }
+        val best = found.filter { it.cost == minCost }
+        return if (best.size == 1) best[0].w else null
     }
 
     /** كلمة واحدة: تبقى كما هي إن كانت معروفة، وإلا تُستبدل بأقرب كلمة معروفة قوية. */
-    fun fixWord(w: String): String {
-        if (!on || w.length < 3 || !isArabicWord(w)) return w
-        if (cnt(w) >= minCount) return w
-        return suggest(w) ?: w
+    fun fixWord(w0: String): String {
+        if (!on || w0.length < 3 || !isArabicWord(w0)) return w0
+        val w = canon(w0)
+        if (isValid(w)) return w0
+        return suggest(w) ?: w0
+    }
+
+    private fun inferSalawat(toks: List<String>): List<String> {
+        val out = ArrayList<String>(toks.size + 4)
+        var i = 0
+        while (i < toks.size) {
+            out.add(toks[i])
+            if (i >= 1 && toks[i] == "الله" && toks[i - 1] == "رسول") {
+                var j = i + 1
+                var k = 0
+                while (j < toks.size && k < 3 && toks[j].length <= 8 && isArabicWord(toks[j]) && !isValid(canon(toks[j]))) {
+                    j++
+                    k++
+                }
+                if (k >= 1) {
+                    out.add("صلى")
+                    out.add("الله")
+                    out.add("عليه")
+                    out.add("وسلم")
+                    i = j
+                    continue
+                }
+            }
+            i++
+        }
+        return out
     }
 
     /** نص بعد التطبيع: تُصحَّح كلماته للبحث فقط. */
     fun fixNorm(norm: String): String {
         if (!on || norm.isEmpty()) return norm
-        val sb = StringBuilder(norm.length)
-        var first = true
-        for (t in norm.split(' ')) {
-            if (t.isEmpty()) continue
-            if (!first) sb.append(' ')
-            sb.append(fixWord(t))
-            first = false
+        val toks = norm.split(' ').filter { it.isNotEmpty() }.map { fixWord(it) }
+        val res = if (guessSalawat && baseSize > 100_000) inferSalawat(toks) else toks
+        return res.joinToString(" ")
+    }
+
+    /** مواضع الكلمات: تُصحَّح الكلمات، ويُستدل على رمز «ﷺ» الصغير بعد «رسول الله». */
+    fun fixBoxes(boxes: List<WordBox>): List<WordBox> {
+        if (!on || boxes.isEmpty()) return boxes
+        val out = ArrayList<WordBox>(boxes.size)
+        for (b in boxes) out.add(b.copy(w = fixWord(b.w)))
+        if (!(guessSalawat && baseSize > 100_000)) return out
+        var i = 1
+        while (i < out.size) {
+            if (out[i].w == "الله" && out[i - 1].w == "رسول") {
+                var j = i + 1
+                var k = 0
+                while (j < out.size && k < 3 && out[j].w.length <= 8 && isArabicWord(out[j].w) && !isValid(canon(out[j].w))) {
+                    j++
+                    k++
+                }
+                if (k >= 1) {
+                    for (t in i + 1 until j) out[t] = out[t].copy(w = "صلىاللهعليهوسلم")
+                    i = j
+                    continue
+                }
+            }
+            i++
         }
-        return sb.toString()
+        return out
     }
 }
 __EOF__
@@ -1039,7 +1282,7 @@ class Indexer(private val ctx: Context, private val dao: BookDao) {
      */
     suspend fun index(bookId: Long, forceOcr: Boolean, restart: Boolean, opts: IndexOptions) {
         val book = dao.getBook(bookId) ?: return
-        Lexicon.ensureLoaded(ctx)
+        Lexicon.ensureBase(ctx)
         if (book.status == ST_DONE && !forceOcr && !restart) return
         val file = File(ctx.filesDir, "books/$bookId.pdf")
         if (!file.exists()) {
@@ -1109,7 +1352,7 @@ class Indexer(private val ctx: Context, private val dao: BookDao) {
                                 stripper.glyphs.clear()
                                 stripper.setStartPage(i)
                                 stripper.setEndPage(i)
-                                t = Normalizer.normalize(stripper.getText(d), Normalizer.Form.NFKC)
+                                t = Formulas.fix(Normalizer.normalize(stripper.getText(d), Normalizer.Form.NFKC))
                                 if (opts.saveBoxes) {
                                     val box = d.getPage(i - 1).cropBox
                                     words = buildWords(stripper.glyphs, box.width, box.height)
@@ -1174,15 +1417,14 @@ class Indexer(private val ctx: Context, private val dao: BookDao) {
                 for ((page, res) in results) {
                     val r = res.first
                     if (r.isNotBlank()) {
-                        val t = r.trim()
+                        val t = Formulas.fix(r.trim())
                         Lexicon.learnBoxes(res.second)
                         // التصحيح للبحث فقط: النص المعروض يبقى كما قرأه الـ OCR
                         val nn = Lexicon.fixNorm(Arabic.normalize(t))
                         ents.add(PageEntity(bookId = bookId, pageNo = page, text = t, norm = nn))
                         okPages.add(page)
                         if (opts.saveBoxes) {
-                            val bx = if (Lexicon.on) res.second.map { it.copy(w = Lexicon.fixWord(it.w)) } else res.second
-                            WordStore.save(ctx, bookId, page, bx)
+                            WordStore.save(ctx, bookId, page, Lexicon.fixBoxes(res.second))
                         }
                     }
                 }
@@ -2355,6 +2597,9 @@ fun SettingsScreen(vm: AppViewModel) {
     val lexPicker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri -> if (uri != null) vm.importLexicon(uri) }
+    val refPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri -> if (uri != null) vm.importReferenceText(uri) }
 
     Scaffold(topBar = { CenterAlignedTopAppBar(title = { Text("الإعدادات") }) }) { pad ->
         Column(
@@ -2482,7 +2727,12 @@ fun SettingsScreen(vm: AppViewModel) {
 
             SettingsCard("المعجم اللغوي") {
                 SwitchRow("استعمال المعجم لتحسين البحث في صفحات الـ OCR", vm.lexOn) { vm.updateLexOn(it) }
-                Text("الكلمات المتعلَّمة: ${Lexicon.learnedSize} • المستوردة: ${Lexicon.importedSize}")
+                Text("المعجم الكبير: ${Lexicon.baseSize} كلمة • المتعلَّمة من كتبك: ${Lexicon.learnedSize}")
+                if (Lexicon.status.isNotEmpty()) {
+                    Text(Lexicon.status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                }
+                SwitchRow("تصحيح صيغ «صلى الله عليه وسلم» و«رضي الله عنه» المعكوسة", vm.formulaFix) { vm.updateFormulaFix(it) }
+                SwitchRow("استنتاج رمز ﷺ بعد «رسول الله» في صفحات الـ OCR", vm.lexGuess) { vm.updateLexGuess(it) }
                 SwitchRow("التعلّم من الصفحات السليمة أثناء الفهرسة", vm.lexLearn) { vm.updateLexLearn(it) }
                 SwitchRow("التعلّم من كلمات الـ OCR عالية الثقة", vm.lexLearnOcr) { vm.updateLexLearnOcr(it) }
                 Text("أقل تكرار لاعتبار الكلمة صحيحة")
@@ -2503,13 +2753,16 @@ fun SettingsScreen(vm: AppViewModel) {
                     Text(if (Lexicon.busy) "جارٍ العمل…" else "بناء المعجم من كتبي")
                 }
                 TextButton(onClick = { lexPicker.launch(arrayOf("text/plain", "*/*")) }, enabled = !Lexicon.busy) {
-                    Text("استيراد قائمة كلمات (txt)")
+                    Text("استبدال المعجم الكبير بقائمة كلمات (txt)")
+                }
+                TextButton(onClick = { refPicker.launch(arrayOf("text/plain", "*/*")) }, enabled = !Lexicon.busy) {
+                    Text("استيراد نص مرجعي (مثل المصحف) للمعجم")
                 }
                 TextButton(onClick = { vm.applyLexicon() }, enabled = !Lexicon.busy) {
                     Text("تطبيق المعجم على الكتب المفهرسة")
                 }
                 TextButton(onClick = { vm.clearLexicon(false) }, enabled = !Lexicon.busy) { Text("مسح المعجم المتعلَّم") }
-                TextButton(onClick = { vm.clearLexicon(true) }, enabled = !Lexicon.busy) { Text("مسح القائمة المستوردة") }
+                TextButton(onClick = { vm.clearLexicon(true) }, enabled = !Lexicon.busy) { Text("مسح المعجم الكبير") }
             }
 
             SettingsCard("التخزين") {
@@ -2525,6 +2778,11 @@ fun SettingsScreen(vm: AppViewModel) {
 
             SettingsCard("سجل التغييرات") {
                 Text("الإصدار $APP_VERSION", fontWeight = FontWeight.Bold)
+                Text("• معجم كبير بملايين الكلمات يُجهَّز مرة واحدة ويعمل دون إنترنت")
+                Text("• إصلاح «ملسو هيلع هللا ىلص» وأمثالها إلى الصيغة الصحيحة")
+                Text("• استنتاج رمز ﷺ بعد «رسول الله» في صفحات الـ OCR، واستيراد نص مرجعي كالمصحف")
+                Spacer(Modifier.height(6.dp))
+                Text("الإصدار 1.7", fontWeight = FontWeight.Bold)
                 Text("• معجم لغوي يتعلّم من كتبك ويقبل قائمة كلمات مستوردة")
                 Text("• تصحيح الكلمات المقروءة بالـ OCR في عمود البحث والتظليل فقط، دون تغيير النص")
                 Text("• تطبيق المعجم على الكتب المفهرسة دون إعادة القراءة بالـ OCR")
@@ -3105,7 +3363,7 @@ data class Hit(
 
 data class ReaderTarget(val bookId: Long, val page: Int, val terms: List<String>)
 
-const val APP_VERSION = "1.7"
+const val APP_VERSION = "1.8"
 
 fun arrangeBooks(list: List<BookEntity>, filter: String, sort: Int): List<BookEntity> {
     val f = Arabic.normalize(filter)
@@ -3178,6 +3436,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var lexMax by mutableIntStateOf(prefs.getInt("lexMax", 600_000))
     var lexLearn by mutableStateOf(prefs.getBoolean("lexLearn", true))
     var lexLearnOcr by mutableStateOf(prefs.getBoolean("lexLearnOcr", true))
+    var formulaFix by mutableStateOf(prefs.getBoolean("formulaFix", true))
+    var lexGuess by mutableStateOf(prefs.getBoolean("lexGuess", true))
     var textVersion by mutableIntStateOf(0)
 
     // ---------- المكتبة العامة: فهرس Internet Archive المفتوح ----------
@@ -3244,7 +3504,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         Lexicon.maxWords = lexMax
         Lexicon.learn = lexLearn
         Lexicon.learnOcr = lexLearnOcr
+        Lexicon.guessSalawat = lexGuess
+        Formulas.on = formulaFix
     }
+
+    fun updateFormulaFix(v: Boolean) { formulaFix = v; prefs.edit().putBoolean("formulaFix", v).apply(); pushLexicon() }
+    fun updateLexGuess(v: Boolean) { lexGuess = v; prefs.edit().putBoolean("lexGuess", v).apply(); pushLexicon() }
 
     fun updateLexOn(v: Boolean) { lexOn = v; prefs.edit().putBoolean("lexOn", v).apply(); pushLexicon() }
     fun updateLexMin(v: Int) { lexMin = v; prefs.edit().putInt("lexMin", v).apply(); pushLexicon() }
@@ -3259,11 +3524,29 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             Lexicon.busy = true
             try {
                 val n = Lexicon.importList(getApplication<Application>(), uri)
-                message = "تم استيراد $n كلمة إلى المعجم"
+                message = "تم تجهيز المعجم الكبير: $n كلمة"
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 message = "تعذّر استيراد القائمة: ${e.message ?: "خطأ"}"
+            } finally {
+                Lexicon.busy = false
+            }
+        }
+    }
+
+    /** يستورد نصاً مرجعياً (مثل المصحف) فتُضاف كلماته إلى المعجم المتعلَّم بوزن قوي. */
+    fun importReferenceText(uri: Uri) {
+        if (Lexicon.busy) return
+        viewModelScope.launch(Dispatchers.IO) {
+            Lexicon.busy = true
+            try {
+                val n = Lexicon.importText(getApplication<Application>(), uri)
+                message = "تمت إضافة $n كلمة من النص المرجعي إلى المعجم"
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                message = "تعذّر استيراد النص: ${e.message ?: "خطأ"}"
             } finally {
                 Lexicon.busy = false
             }
@@ -3316,7 +3599,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 dao.setNormForPage(b.id, p, Lexicon.fixNorm(Arabic.normalize(t)))
                 val boxes = WordStore.load(app, b.id, p)
                 if (boxes.isNotEmpty()) {
-                    WordStore.save(app, b.id, p, boxes.map { it.copy(w = Lexicon.fixWord(it.w)) })
+                    WordStore.save(app, b.id, p, Lexicon.fixBoxes(boxes))
                 }
                 fixed++
             }
@@ -3343,8 +3626,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun clearLexicon(importedList: Boolean) {
-        if (importedList) Lexicon.clearImported() else Lexicon.clearLearned()
-        message = if (importedList) "مُسحت القائمة المستوردة" else "مُسح المعجم المتعلَّم"
+        if (importedList) Lexicon.clearBase() else Lexicon.clearLearned()
+        message = if (importedList) "مُسح المعجم الكبير" else "مُسح المعجم المتعلَّم"
     }
 
     fun updateOcrModel(v: Int) { ocrModel = v; prefs.edit().putInt("ocrModel", v).apply() }
@@ -3410,19 +3693,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val app = getApplication<Application>()
             val r = withContext(Dispatchers.Default) {
-                Lexicon.ensureLoaded(app)
+                Lexicon.ensureBase(app)
                 Work.indexer(app).ocrOne(bookId, pageNo, ocrIgnoreMarks)
             }
-            val t = r.first
+            val t = Formulas.fix(r.first)
             if (t.isBlank()) {
                 done(false)
             } else {
                 Lexicon.learnBoxes(r.second)
                 dao.updatePage(bookId, pageNo, t.trim(), Lexicon.fixNorm(Arabic.normalize(t)))
-                if (saveBoxes) {
-                    val bx = if (Lexicon.on) r.second.map { it.copy(w = Lexicon.fixWord(it.w)) } else r.second
-                    WordStore.save(app, bookId, pageNo, bx)
-                }
+                if (saveBoxes) WordStore.save(app, bookId, pageNo, Lexicon.fixBoxes(r.second))
                 textVersion++
                 done(true)
             }
@@ -3459,7 +3739,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         pushLexicon()
-        viewModelScope.launch(Dispatchers.IO) { Lexicon.ensureLoaded(getApplication<Application>()) }
+        viewModelScope.launch(Dispatchers.IO) { Lexicon.ensureBase(getApplication<Application>()) }
         ArabicOpts.taMarbuta = normTa
         ArabicOpts.alefMaksura = normAlef
         ArabicOpts.hamza = normHamza
@@ -4154,6 +4434,8 @@ dependencyResolutionManagement {
 rootProject.name = "BahithPDF"
 include(":app")
 __EOF__
-mkdir -p app/src/main/assets/tessdata
+mkdir -p app/src/main/assets/tessdata app/src/main/assets/lexicon
 curl -L --fail --retry 3 -o app/src/main/assets/tessdata/ara_best.traineddata https://github.com/tesseract-ocr/tessdata_best/raw/main/ara.traineddata || echo "best model download failed (optional)"
-ls -l app/src/main/assets/tessdata || true
+# قائمة كلمات عربية مفتوحة الترخيص (MIT) نحو 3.5 مليون كلمة؛ إن فشل التنزيل يعمل التطبيق بالمعجم المتعلَّم فقط
+curl -L --fail --retry 3 -o app/src/main/assets/lexicon/arabic-words.txt https://raw.githubusercontent.com/MustafaLinux/arabic-words-list/main/arabic-words.txt || echo "word list download failed (optional)"
+ls -l app/src/main/assets/tessdata app/src/main/assets/lexicon || true
